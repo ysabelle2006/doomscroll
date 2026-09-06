@@ -1,11 +1,11 @@
 [project]
-name = "gazescroll"
+name = "doomscroll"
 version = "0.1.0"
 description = "Gaze/head-tracking content-aware auto-scroll"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "opencv-contrib-python>=4.10",
-    "mediapipe>=0.10.18",
+    "mediapipe==0.10.21",
     "numpy",
     "scikit-learn",
     "mss",
@@ -20,6 +20,9 @@ macos = ["pyobjc-framework-Quartz", "pyobjc-framework-Cocoa"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+package = false
 
 [build-system]
 requires = ["setuptools>=68"]
