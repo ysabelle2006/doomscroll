@@ -39,6 +39,7 @@ def main() -> None:
     backend = MediaPipeLandmarkBackend()
     pose_estimator = HeadPoseEstimator()
     with WebcamSource(0) as cam:
+        print("Debug view running. Press 'q' to quit.")
         while True:
             ok, frame = cam.read()
             if not ok or frame is None:
@@ -75,7 +76,7 @@ def main() -> None:
                 pose_estimator.reset()
                 cv2.putText(frame, "No face detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            cv2.imshow("gazescroll - Phase 1 debug view", frame)
+            cv2.imshow("doomscroll - Phase 1 debug view", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
