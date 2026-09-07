@@ -38,9 +38,9 @@ _LANDMARK_INDICES = [
     MOUTH_RIGHT_CORNER,
 ]
 
-# Default starting guesses: looking straight ahead, 60cm from the camera
+# Default starting guesses: looking straight ahead, 40cm from the camera
 _DEFAULT_RVEC = np.zeros((3, 1))
-_DEFAULT_TVEC = np.array([[0.0], [0.0], [600.0]])
+_DEFAULT_TVEC = np.array([[0.0], [0.0], [400.0]])
 
 
 @dataclass
