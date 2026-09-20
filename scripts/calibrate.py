@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.capture.webcam import WebcamSource
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
-from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
+from doomscroll.gaze.calibration import FEATURE_DIM, GazeCalibrator, build_feature_vector
 from doomscroll.gaze.gaze_vector import compute_gaze_feature, is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.landmarks.mediapipe_backend import MediaPipeLandmarkBackend
@@ -82,24 +82,88 @@ POSE_VARIANTS = [
     ("lean RIGHT", "Lean your head slightly to the RIGHT and hold that position -- keep tracking dots with your eyes only."),
     ("lean CLOSER", "Lean slightly CLOSER to the screen and hold that position -- keep tracking dots with your eyes only."),
     ("sit BACK", "Sit slightly further BACK from the screen and hold that position -- keep tracking dots with your eyes only."),
-    ("tilt UP", "Tilt your head slightly UP (chin up) and hold that position -- keep tracking dots with your eyes only, don't drop your eyes to compensate."),
-    ("tilt DOWN", "Tilt your head slightly DOWN (chin down) and hold that position -- keep tracking dots with your eyes only, don't raise your eyes to compensate."),
+    ("tilt UP", "Tilt your head slightly UP and hold that position -- keep tracking dots with your eyes only, don't drop your eyes to compensate."),
+    ("tilt DOWN", "Tilt your head slightly DOWN (not too far) and hold that position -- keep tracking dots with your eyes only, don't raise your eyes to compensate."),
 ]
+
+
+_display_size: tuple[int, int] | None = None  # set once in main(), see _detect_display_size()
+
+
+def _detect_display_size(screen_w: int, screen_h: int) -> tuple[int, int]:
+    """Ask OpenCV what pixel size it actually gave the fullscreen window,
+    instead of trusting our own screen-size query (get_screen_size()) to
+    exactly match it. Switching that query to Quartz (see dpi.py) was meant
+    to fix the grey strip left uncovered along one edge of the window, but a
+    gap was still observed afterwards -- so rather than keep guessing at the
+    exact cause (Retina backing-store scaling, multi-monitor placement, or
+    something else in how the Cocoa highgui backend sizes its content view),
+    ask OpenCV directly and scale every rendered frame to fill *that* size.
+    Falls back to (screen_w, screen_h) -- today's status quo -- if the query
+    isn't supported or the window hasn't settled yet."""
+    blank = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+    # present twice: some backends only finish resizing the content view to
+    # the fullscreen frame after the window has already been shown once
+    for _ in range(2):
+        cv2.imshow(WINDOW_NAME, blank)
+        cv2.waitKey(150)
+    try:
+        _, _, w, h = cv2.getWindowImageRect(WINDOW_NAME)
+    except Exception:
+        w, h = 0, 0
+    if w > 0 and h > 0:
+        return w, h
+    return screen_w, screen_h
+
+
+def _present(frame: np.ndarray) -> None:
+    """Shows `frame` (drawn in the logical, DPI-aware screen_w x screen_h
+    coordinate space that calibration math and the runtime gaze->scroll
+    mapping both rely on) scaled to fill the real detected window size, so
+    the two can differ without leaving any of the window uncovered."""
+    if _display_size is not None and _display_size != (frame.shape[1], frame.shape[0]):
+        frame = cv2.resize(frame, _display_size, interpolation=cv2.INTER_NEAREST)
+    cv2.imshow(WINDOW_NAME, frame)
+
+
+def _wrap_line(text: str, font: int, font_scale: float, thickness: int, max_width: int) -> list[str]:
+    """Greedily wraps `text` on spaces so every rendered line measures at
+    most max_width pixels (via cv2.getTextSize). Without this, a long
+    instruction string is drawn as a single line and silently runs off the
+    right edge of the screen instead of wrapping -- which is exactly what
+    happened with the longer pose-variant instructions (e.g. "tilt UP"/
+    "tilt DOWN")."""
+    words = text.split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        (w, _), _ = cv2.getTextSize(candidate, font, font_scale, thickness)
+        if w <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
 def draw_target(screen_w: int, screen_h: int, point_px: tuple[int, int], instruction: str = STILL_INSTRUCTION) -> np.ndarray:
     frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
     cv2.circle(frame, point_px, POINT_RADIUS, (0, 220, 255), -1)
     cv2.circle(frame, point_px, POINT_RADIUS, (255, 255, 255), 2)
-    cv2.putText(
-        frame,
-        instruction,
-        (20, screen_h - 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (150, 150, 150),
-        1,
-    )
+
+    # Wrap the bottom status text so long instructions (the pose-variant
+    # strings, in particular) stay on screen instead of running off the
+    # right edge -- see _wrap_line().
+    font, font_scale, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1, 20
+    lines = _wrap_line(instruction, font, font_scale, thickness, screen_w - 2 * margin)
+    line_height = 26
+    base_y = screen_h - 30  # baseline the single-line version used to sit on
+    start_y = base_y - line_height * (len(lines) - 1)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (margin, start_y + i * line_height), font, font_scale, (150, 150, 150), thickness)
     return frame
 
 
@@ -108,17 +172,25 @@ def show_transition_message(screen_w: int, screen_h: int, message: str, duration
     a new head position) before the next mini-sequence starts capturing, so
     they have time to get into position and hold it."""
     frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-    for i, line in enumerate(message.split(" -- ")):
-        cv2.putText(
-            frame,
-            line,
-            (screen_w // 2 - 420, screen_h // 2 + i * 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 220, 255),
-            2,
-        )
-    cv2.imshow(WINDOW_NAME, frame)
+    font, font_scale, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2, 60
+
+    # Each " -- "-separated segment is wrapped independently (the longer
+    # pose-variant messages, e.g. "tilt DOWN", otherwise ran off the right
+    # edge of the screen), and every resulting line is centered using its
+    # own measured width rather than a fixed offset that only happened to
+    # center one specific line length.
+    lines: list[str] = []
+    for segment in message.split(" -- "):
+        lines.extend(_wrap_line(segment, font, font_scale, thickness, screen_w - 2 * margin))
+
+    line_height = 40
+    start_y = screen_h // 2 - (line_height * (len(lines) - 1)) // 2
+    for i, line in enumerate(lines):
+        (text_w, _), _ = cv2.getTextSize(line, font, font_scale, thickness)
+        x = screen_w // 2 - text_w // 2
+        cv2.putText(frame, line, (x, start_y + i * line_height), font, font_scale, (0, 220, 255), thickness)
+
+    _present(frame)
     deadline = time.time() + duration_s
     while time.time() < deadline:
         if cv2.waitKey(1) & 0xFF == 27:
@@ -136,8 +208,19 @@ def collect_samples_for_point(
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     features: list[np.ndarray] = []
     targets: list[np.ndarray] = []
+    # Diagnostic counters -- when a point captures few/zero samples, these
+    # say *why* (no face in frame vs. blink-rejected vs. head-pose solve
+    # rejected) instead of leaving it a silent mystery. A run of "no_face"
+    # almost always means the pose asked for pushed the face out of the
+    # webcam's detection cone (e.g. laptop webcams already look down at you
+    # from above the screen, so tilting the chin down further is the
+    # direction most likely to do this).
+    frames_seen = 0
+    no_face = 0
+    blink_rejected = 0
+    pose_rejected = 0
 
-    cv2.imshow(WINDOW_NAME, draw_target(screen_w, screen_h, point_px, instruction))
+    _present(draw_target(screen_w, screen_h, point_px, instruction))
     cv2.waitKey(1)
 
     settle_deadline = time.time() + SETTLE_S
@@ -151,15 +234,19 @@ def collect_samples_for_point(
         ok, frame = cam.read()
         if not ok or frame is None:
             continue
+        frames_seen += 1
         timestamp_ms = cam.frame_timestamp_ms()
         result = backend.detect(frame, timestamp_ms)
         if result is None:
+            no_face += 1
             continue
         points_px = result.points_px()
         if not is_gaze_usable(points_px):
+            blink_rejected += 1
             continue  # mid-blink frame -- iris position unreliable, skip it
         head_pose = pose_estimator.estimate(points_px, result.image_width, result.image_height)
         if head_pose is None:
+            pose_rejected += 1
             continue
         gaze_feature = compute_gaze_feature(points_px)
         feature = build_feature_vector(
@@ -172,6 +259,14 @@ def collect_samples_for_point(
 
         if cv2.waitKey(1) & 0xFF == 27:
             raise KeyboardInterrupt
+
+    if len(features) < 10:
+        print(
+            f"    !! only {len(features)}/{frames_seen} frames usable "
+            f"(no_face={no_face}, blink={blink_rejected}, pose_rejected={pose_rejected})"
+        )
+        if no_face > frames_seen * 0.5:
+            print("       -- face was mostly not detected here; this pose may be pushing your face out of the webcam's view")
 
     return features, targets
 
@@ -199,6 +294,17 @@ def run_sequence(
         all_features.extend(features)
         all_targets.extend(targets)
         all_groups.extend([group_offset + i] * len(features))  # tag every sample with which point it came from
+
+    # np.array([]) on an empty list collapses to shape (0,) rather than
+    # (0, FEATURE_DIM)/(0, 2) -- harmless on its own, but np.concatenate()
+    # against the running (N, FEATURE_DIM) accumulator in main() then fails
+    # with a dimension mismatch. This happens for real whenever every single
+    # point in a sequence captures zero samples (e.g. a pose variant that
+    # loses face tracking throughout) -- not just a theoretical edge case.
+    # Force the correct 2D shape explicitly so an all-empty sequence is a
+    # harmless no-op contribution instead of a crash.
+    if not all_features:
+        return np.empty((0, FEATURE_DIM)), np.empty((0, 2)), np.empty((0,), dtype=int)
     return np.array(all_features), np.array(all_targets), np.array(all_groups)
 
 
@@ -211,6 +317,12 @@ def main() -> None:
     pose_estimator = HeadPoseEstimator()
     cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    global _display_size
+    _display_size = _detect_display_size(screen_w, screen_h)
+    if _display_size != (screen_w, screen_h):
+        print(f"Note: fullscreen window renders at {_display_size[0]}x{_display_size[1]} "
+              f"vs logical {screen_w}x{screen_h}; scaling frames to fill it exactly.")
 
     try:
         with WebcamSource(0) as cam:
@@ -238,6 +350,13 @@ def main() -> None:
                     group_offset=next_group_id,
                 )
                 next_group_id += len(POSE_VARIATION_FRACTIONS)
+                if features.shape[0] == 0:
+                    print(
+                        f"    !! captured nothing usable for '{label}' -- this variant contributes "
+                        "no data to the model. The pose was likely too extreme (face lost by the "
+                        "webcam) or held too briefly. Consider re-running with a gentler version of "
+                        "this pose."
+                    )
                 all_features = np.concatenate([all_features, features])
                 all_targets = np.concatenate([all_targets, targets])
                 all_groups = np.concatenate([all_groups, groups])
@@ -261,6 +380,16 @@ def main() -> None:
             print(f"Gain (predicted range / actual range), x,y: {gain} -- 1.0 is ideal, well below 1.0 means compressed")
 
             print("Validation points:")
+            # Without this, validation starts immediately after the last
+            # pose variant (tilt DOWN) with only the small grey status text
+            # changing back to the "keep still" instruction -- easy to miss,
+            # leaving it unclear to the user that they should stop tilting
+            # their head and return to a normal position first.
+            show_transition_message(
+                screen_w,
+                screen_h,
+                "Return your head to a normal, centered position -- keep tracking dots with your eyes only.",
+            )
             val_features, val_targets, _val_groups = run_sequence(
                 cam, backend, pose_estimator, screen_w, screen_h, VALIDATION_FRACTIONS
             )

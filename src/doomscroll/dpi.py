@@ -32,7 +32,31 @@ def ensure_dpi_aware() -> None:
 
 def get_screen_size() -> tuple[int, int]:
     """True physical screen size -- call ensure_dpi_aware() first, or this
-    returns the same virtualized/scaled-down size described above."""
+    returns the same virtualized/scaled-down size described above.
+
+    On macOS this queries Quartz directly instead of going through Tkinter.
+    Tk's winfo_screenwidth()/winfo_screenheight() has been observed to
+    disagree with the screen size AppKit/Cocoa windows actually use -- off
+    by several dozen pixels, usually in width, on displays using a
+    non-native "scaled" resolution -- which left a stray grey strip along
+    one edge of the OpenCV fullscreen calibration window uncovered by our
+    own rendered frame (OpenCV's highgui window on macOS is itself a Cocoa
+    window under the hood, so querying the same framework Cocoa uses keeps
+    the two in agreement). Falls back to the Tk-based query if pyobjc/Quartz
+    isn't available for any reason.
+    """
+    if sys.platform == "darwin":
+        try:
+            import Quartz
+
+            display_id = Quartz.CGMainDisplayID()
+            w = Quartz.CGDisplayPixelsWide(display_id)
+            h = Quartz.CGDisplayPixelsHigh(display_id)
+            if w and h:
+                return int(w), int(h)
+        except Exception:
+            pass  # fall through to the Tk-based query below
+
     import tkinter as tk
 
     root = tk.Tk()
