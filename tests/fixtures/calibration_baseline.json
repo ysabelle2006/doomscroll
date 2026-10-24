@@ -1,0 +1,12 @@
+{
+  "mean_error_px": 85.96970619327767,
+  "pct_of_diagonal": 4.768397977188082,
+  "gain_x": 1.288339997993519,
+  "gain_y": 2.357852375992882,
+  "selected_alpha_x": 35.11191734215127,
+  "selected_alpha_y": 35.11191734215127,
+  "n_train_samples": 1664,
+  "n_val_samples": 194,
+  "source": "recorded session: /Users/ysabellewong/Library/Application Support/gazescroll/calibration/last_dataset.npz",
+  "saved_at": "2026-10-24T05:38:15"
+}
