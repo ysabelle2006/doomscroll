@@ -49,6 +49,8 @@ pytest
 
 Runs the unit/synthetic test suite (`tests/`) — gaze vector math, head pose, smoothing, calibration fitting, session storage, and the pose-variant readout logic — all against synthetic, deterministic fixtures (no camera or MediaPipe model needed).
 
+(pytest creates a `.pytest_cache/` directory to track state like last-failed tests between runs. It's local scratch state, not something to commit — pytest already drops its own `.gitignore` inside that directory, so it's self-ignoring regardless of this project's `.gitignore`.)
+
 To check whether a change to the calibration pipeline itself helped or hurt, using your own *real* recorded data:
 
 ```
