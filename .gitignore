@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.egg-info/
+.DS_Store
+# Face videos are personal data: never commit recordings or datasets.
+data/
