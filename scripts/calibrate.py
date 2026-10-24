@@ -1,6 +1,12 @@
 """Phase 2: 16-point on-screen gaze calibration, plus a head-pose variation
 pass.
 
+Before the main pass starts, a live readiness screen (wait_for_front_ready())
+shows the camera feed plus your current yaw/pitch/distance and whether that
+looks roughly straight -- so you can see you're actually in frame and get a
+concrete reference point for "this is normally how far/centered I sit"
+before committing to it for the whole main pass.
+
 Main pass: keep your head facing forward, roughly toward the center of the
 screen, and use ONLY your eyes to look at each dot as it appears -- don't
 turn your head toward it. Small incidental fidgeting is fine (that's what
@@ -25,9 +31,10 @@ extrapolating blindly.
 
 Each pose-variant transition is self-paced: instead of showing the
 instruction for a fixed duration and hoping that was long enough, it shows
-a live readout (yaw/pitch/camera-distance, whichever that variant actually
-depends on) and waits for you to press SPACE once you're actually holding
-the position -- see wait_for_pose_ready(). People take a different amount
+the live camera feed plus a readout (yaw/pitch/camera-distance, whichever
+that variant actually depends on) and waits for you to press SPACE once
+you're actually holding the position and still visibly in frame -- see
+wait_for_pose_ready(). People take a different amount
 of time to find and hold an off-center pose; a fixed timer either wastes
 time once you're already there, or starts capturing before someone who
 needed longer has actually arrived, quietly mixing mid-transition frames
@@ -68,9 +75,40 @@ WINDOW_NAME = "doomscroll calibration"
 SETTLE_S = 0.6
 CAPTURE_S = 1.4
 POINT_RADIUS = 18
-TRANSITION_S = 2.2  # how long each head-pose-variant instruction is shown before capture starts
+
+# Deliberately stricter than gaze_vector.DEFAULT_MIN_EYE_ASPECT_RATIO (which
+# live tracking uses). Live tracking needs recall -- rejecting a genuine
+# downward glance as a "blink" freezes the cursor, so it's tuned loose. But
+# calibration has the opposite priority: precision. Each point gets ~40
+# frames over CAPTURE_S and only needs a couple dozen good ones, so there's
+# no cost to being picky, and every cost to not being: a frame where the eye
+# is narrowed-but-not-closed still measures a compressed iris offset (the
+# eyelid is cropping how far the iris visibly travels), which teaches the
+# model "this small offset means a target way down the screen" -- then that
+# same small-offset reading recurs for genuinely centered gaze live, and the
+# model (especially the local-correction stage, which is sensitive to a
+# handful of mislabeled neighbors) pulls it toward "down" too. That's what
+# turned "center sometimes reads as down" into "everything reads as down"
+# once more of these partially-narrowed frames started clearing the loosened
+# live threshold and flowing into training. A stricter gate here keeps those
+# frames out of the training set entirely, at the cost of some points (esp.
+# combined down+sideways poses, which seem to be this project's hardest
+# combination for this user) capturing fewer or zero samples -- which the
+# <10-sample discard in collect_samples_for_point already handles safely.
+CALIBRATION_MIN_EAR = 0.12
 
 STILL_INSTRUCTION = "keep your head still & facing forward -- move only your eyes to the dot"
+
+# How far yaw/pitch may sit from dead-on-0 and still count as "straight" on
+# the pre-main-pass readiness screen (wait_for_front_ready()) -- purely
+# informational (like the pose-variant ranges, it's never enforced; SPACE
+# always proceeds), just loose enough that normal, comfortable sitting
+# posture reads as "straight" rather than nagging over a degree or two.
+FRONT_YAW_PITCH_TOLERANCE_DEG = 8.0
+FRONT_READY_INSTRUCTION = (
+    "Sit facing forward, centered in frame, at whatever distance feels natural "
+    "-- this is where the main pass will track your eyes from."
+)
 
 # 4x4 grid (16 points) instead of the earlier 3x3 (9) for denser spatial
 # coverage -- more independent calibration events for RidgeCV's per-region
@@ -133,7 +171,7 @@ POSE_VARIANTS = [
     PoseVariant(
         "sit BACK",
         "Sit slightly further BACK from the screen and hold that position -- keep tracking dots with your eyes only.",
-        z_delta_range=(80.0, 200.0),
+        z_delta_range=(50.0, 130.0),
     ),
     PoseVariant(
         "tilt UP",
@@ -187,6 +225,29 @@ def _present(frame: np.ndarray) -> None:
     cv2.imshow(WINDOW_NAME, frame)
 
 
+def _camera_background(frame: np.ndarray | None, screen_w: int, screen_h: int) -> np.ndarray:
+    """Builds the live-preview background for a wait screen: the current
+    webcam frame stretched to fill the logical screen_w x screen_h canvas,
+    so a person getting into position can see whether their head is still
+    actually in frame -- rather than a plain black screen that gives no
+    feedback on framing at all. Falls back to black if no frame is
+    available yet (camera still warming up / a dropped read)."""
+    if frame is None:
+        return np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+    return cv2.resize(frame, (screen_w, screen_h))
+
+
+def _darken_band(canvas: np.ndarray, y0: int, y1: int, alpha: float = 0.55) -> None:
+    """Dims a horizontal band of `canvas` in place, behind where overlay
+    text is about to be drawn. Needed once the background became a live
+    camera feed instead of solid black -- a bright/varied face/background
+    can otherwise wash out the instruction and readout text."""
+    y0, y1 = max(0, y0), min(canvas.shape[0], y1)
+    if y1 <= y0:
+        return
+    canvas[y0:y1] = (canvas[y0:y1].astype(np.float32) * (1 - alpha)).astype(np.uint8)
+
+
 def _wrap_line(text: str, font: int, font_scale: float, thickness: int, max_width: int) -> list[str]:
     """Greedily wraps `text` on spaces so every rendered line measures at
     most max_width pixels (via cv2.getTextSize). Without this, a long
@@ -226,36 +287,6 @@ def draw_target(screen_w: int, screen_h: int, point_px: tuple[int, int], instruc
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (margin, start_y + i * line_height), font, font_scale, (150, 150, 150), thickness)
     return frame
-
-
-def show_transition_message(screen_w: int, screen_h: int, message: str, duration_s: float = TRANSITION_S) -> None:
-    """Displays a full-screen instruction (e.g. asking the user to shift into
-    a new head position) before the next mini-sequence starts capturing, so
-    they have time to get into position and hold it."""
-    frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-    font, font_scale, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2, 60
-
-    # Each " -- "-separated segment is wrapped independently (the longer
-    # pose-variant messages, e.g. "tilt DOWN", otherwise ran off the right
-    # edge of the screen), and every resulting line is centered using its
-    # own measured width rather than a fixed offset that only happened to
-    # center one specific line length.
-    lines: list[str] = []
-    for segment in message.split(" -- "):
-        lines.extend(_wrap_line(segment, font, font_scale, thickness, screen_w - 2 * margin))
-
-    line_height = 40
-    start_y = screen_h // 2 - (line_height * (len(lines) - 1)) // 2
-    for i, line in enumerate(lines):
-        (text_w, _), _ = cv2.getTextSize(line, font, font_scale, thickness)
-        x = screen_w // 2 - text_w // 2
-        cv2.putText(frame, line, (x, start_y + i * line_height), font, font_scale, (0, 220, 255), thickness)
-
-    _present(frame)
-    deadline = time.time() + duration_s
-    while time.time() < deadline:
-        if cv2.waitKey(1) & 0xFF == 27:
-            raise KeyboardInterrupt
 
 
 def _pose_variant_readout(head_pose: HeadPose | None, variant: PoseVariant, baseline_z: float | None) -> tuple[str, bool, float | None]:
@@ -304,7 +335,16 @@ def wait_for_pose_ready(
     longer has actually gotten there, quietly contaminating that point's
     samples with mid-transition frames. The readout's color is feedback
     only, not a gate: SPACE always proceeds (see PoseVariant's docstring
-    comment on why these ranges aren't enforced)."""
+    comment on why these ranges aren't enforced).
+
+    The background is the live camera feed (not a blank screen) for the
+    same reason the numeric readout exists: so you can see directly
+    whether you're still actually in frame while getting into position,
+    not just trust the numbers. It reverts to the plain black dot-grid
+    screen as soon as SPACE is pressed -- the camera itself keeps running
+    throughout (closing/reopening it between every point would be slow and
+    could re-trigger the camera permission prompt), only the *display*
+    changes."""
     font, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 2, 60
     instruction_lines = _wrap_line(variant.instruction, font, 0.9, thickness, screen_w - 2 * margin)
     baseline_z: float | None = None
@@ -321,9 +361,10 @@ def wait_for_pose_ready(
 
         readout, in_range, baseline_z = _pose_variant_readout(head_pose, variant, baseline_z)
 
-        canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+        canvas = _camera_background(frame if ok else None, screen_w, screen_h)
         line_height = 40
         start_y = screen_h // 2 - 100 - (line_height * (len(instruction_lines) - 1)) // 2
+        _darken_band(canvas, start_y - 40, screen_h // 2 + 110)
         for i, line in enumerate(instruction_lines):
             (text_w, _), _ = cv2.getTextSize(line, font, 0.9, thickness)
             x = screen_w // 2 - text_w // 2
@@ -333,6 +374,84 @@ def wait_for_pose_ready(
             color = (0, 0, 255) if readout == "face not detected" else ((0, 220, 0) if in_range else (0, 165, 255))
             (text_w, _), _ = cv2.getTextSize(readout, font, 0.7, 2)
             cv2.putText(canvas, readout, (screen_w // 2 - text_w // 2, screen_h // 2 + 30), font, 0.7, color, 2)
+
+        hint = "Press SPACE when ready (ESC to abort)"
+        (hint_w, _), _ = cv2.getTextSize(hint, font, 0.7, 2)
+        cv2.putText(canvas, hint, (screen_w // 2 - hint_w // 2, screen_h // 2 + 80), font, 0.7, (150, 150, 150), 2)
+
+        _present(canvas)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            raise KeyboardInterrupt
+        if key == 32:  # SPACE
+            return
+
+
+def _front_readout(head_pose: HeadPose | None) -> tuple[str, bool]:
+    """Pure logic behind wait_for_front_ready()'s live readout -- split out
+    so it's unit-testable without a camera/GUI, same as
+    _pose_variant_readout(). Returns (readout text, whether yaw AND pitch
+    both look roughly straight)."""
+    if head_pose is None:
+        return "face not detected", False
+    yaw_deg, pitch_deg = head_pose.yaw_deg, head_pose.pitch_deg
+    distance_mm = float(head_pose.translation_vector[2, 0])
+    straight = abs(yaw_deg) <= FRONT_YAW_PITCH_TOLERANCE_DEG and abs(pitch_deg) <= FRONT_YAW_PITCH_TOLERANCE_DEG
+    status = "straight" if straight else "not quite straight"
+    return f"yaw={yaw_deg:+.1f} deg  pitch={pitch_deg:+.1f} deg  distance={distance_mm:.0f}mm  ({status})", straight
+
+
+def wait_for_front_ready(
+    cam: WebcamSource,
+    backend: MediaPipeLandmarkBackend,
+    pose_estimator: HeadPoseEstimator,
+    screen_w: int,
+    screen_h: int,
+    instruction: str = FRONT_READY_INSTRUCTION,
+) -> None:
+    """Live-camera readiness screen -- the same self-paced pattern as
+    wait_for_pose_ready(), but reporting yaw/pitch/distance together rather
+    than just one of them, since "am I sitting normally" is a
+    straight/not-straight judgment call across all three at once, not a
+    single range to hit.
+
+    Used twice: once before the main 16-point pass starts (with the default
+    FRONT_READY_INSTRUCTION, establishing the baseline distance the later
+    lean-CLOSER/sit-BACK variants measure their own distance CHANGE
+    against), and again before the validation pass, with a instruction
+    tailored to "you just finished leaning/tilting -- come back to normal
+    before we validate" -- same live-camera-plus-readout-plus-SPACE
+    mechanic, just a different message, rather than that second transition
+    being a blank fixed-duration screen with no feedback on whether you're
+    actually back in frame and facing forward. SPACE always proceeds
+    regardless of the straight/not-straight readout, same as every other
+    wait screen."""
+    font, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 2, 60
+    instruction_lines = _wrap_line(instruction, font, 0.9, thickness, screen_w - 2 * margin)
+
+    while True:
+        ok, frame = cam.read()
+        head_pose = None
+        if ok and frame is not None:
+            timestamp_ms = cam.frame_timestamp_ms()
+            result = backend.detect(frame, timestamp_ms)
+            if result is not None:
+                points_px = result.points_px()
+                head_pose = pose_estimator.estimate(points_px, result.image_width, result.image_height)
+
+        canvas = _camera_background(frame if ok else None, screen_w, screen_h)
+        line_height = 40
+        start_y = screen_h // 2 - 100 - (line_height * (len(instruction_lines) - 1)) // 2
+        _darken_band(canvas, start_y - 40, screen_h // 2 + 110)
+        for i, line in enumerate(instruction_lines):
+            (text_w, _), _ = cv2.getTextSize(line, font, 0.9, thickness)
+            x = screen_w // 2 - text_w // 2
+            cv2.putText(canvas, line, (x, start_y + i * line_height), font, 0.9, (0, 220, 255), thickness)
+
+        readout, straight = _front_readout(head_pose)
+        color = (0, 0, 255) if readout == "face not detected" else ((0, 220, 0) if straight else (0, 165, 255))
+        (text_w, _), _ = cv2.getTextSize(readout, font, 0.7, 2)
+        cv2.putText(canvas, readout, (screen_w // 2 - text_w // 2, screen_h // 2 + 30), font, 0.7, color, 2)
 
         hint = "Press SPACE when ready (ESC to abort)"
         (hint_w, _), _ = cv2.getTextSize(hint, font, 0.7, 2)
@@ -390,14 +509,16 @@ def collect_samples_for_point(
             no_face += 1
             continue
         points_px = result.points_px()
-        if not is_gaze_usable(points_px):
+        if not is_gaze_usable(points_px, min_ear=CALIBRATION_MIN_EAR):
             blink_rejected += 1
-            continue  # mid-blink frame -- iris position unreliable, skip it
+            continue  # mid-blink (or too-narrowed-to-trust) frame -- skip it rather than risk a
+            # degraded iris reading becoming training data (see CALIBRATION_MIN_EAR above)
         head_pose = pose_estimator.estimate(points_px, result.image_width, result.image_height)
         if head_pose is None:
             pose_rejected += 1
             continue
-        gaze_feature = compute_gaze_feature(points_px)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gaze_feature = compute_gaze_feature(points_px, frame_gray=gray)
         feature = build_feature_vector(
             gaze_feature.vector,
             (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
@@ -416,6 +537,14 @@ def collect_samples_for_point(
         )
         if no_face > frames_seen * 0.5:
             print("       -- face was mostly not detected here; this pose may be pushing your face out of the webcam's view")
+        print(
+            "       -- discarding this point's samples: too few to trust. A handful of frames that barely "
+            "squeaked past the blink check tend to be half-closed-eye frames with a degraded iris reading "
+            "(often reading as a near-neutral/centered offset regardless of the true target), and the local "
+            "correction stage is sensitive enough to a few such mislabeled samples that keeping them risks "
+            "biasing nearby live predictions (e.g. true center gaze getting pulled toward this point's target)."
+        )
+        return [], []
 
     return features, targets
 
@@ -509,7 +638,9 @@ def main() -> None:
 
     try:
         with WebcamSource(0) as cam:
-            print("Calibration starting. Keep your head still & forward -- move only your eyes to each dot. ESC to abort.")
+            print("Calibration starting. ESC to abort.")
+            wait_for_front_ready(cam, backend, pose_estimator, screen_w, screen_h)
+            print("Keep your head still & forward -- move only your eyes to each dot.")
             print("Training points:")
             all_features, all_targets, all_groups = run_sequence(
                 cam, backend, pose_estimator, screen_w, screen_h, TRAIN_GRID_FRACTIONS, STILL_INSTRUCTION
@@ -585,11 +716,18 @@ def main() -> None:
             # pose variant (tilt DOWN) with only the small grey status text
             # changing back to the "keep still" instruction -- easy to miss,
             # leaving it unclear to the user that they should stop tilting
-            # their head and return to a normal position first.
-            show_transition_message(
+            # their head and return to a normal position first. Reuses
+            # wait_for_front_ready() (live camera + yaw/pitch/distance
+            # readout + SPACE to continue) rather than a blank fixed-duration
+            # message, so you can actually see you're back in frame and
+            # facing forward before validation starts capturing.
+            wait_for_front_ready(
+                cam,
+                backend,
+                pose_estimator,
                 screen_w,
                 screen_h,
-                "Return your head to a normal, centered position -- keep tracking dots with your eyes only.",
+                instruction="Return your head to a normal, centered position -- keep tracking dots with your eyes only.",
             )
             val_features, val_targets, _val_groups = run_sequence(
                 cam, backend, pose_estimator, screen_w, screen_h, VALIDATION_FRACTIONS

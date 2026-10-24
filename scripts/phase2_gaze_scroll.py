@@ -31,9 +31,9 @@ from doomscroll.scroll import ScrollUnit, get_scroll_injector
 from doomscroll.windowing import get_window_bounds_provider
 
 BOTTOM_DWELL_FRACTION = 0.75  # bottom 25% of the focused window's height
-DWELL_MS = 1000
-SCROLL_COOLDOWN_MS = 800
-SCROLL_STEP_LINES = 3
+DWELL_MS = 500
+SCROLL_COOLDOWN_MS = 200
+SCROLL_STEP_LINES = 4
 DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"
 
 # A degree-2 polynomial calibration model has no bound on its output for
@@ -106,7 +106,8 @@ def main() -> None:
             elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px):
                 status_lines.append("blink...")
             elif points_px is not None and head_pose is not None:
-                gaze_feature = compute_gaze_feature(points_px)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gaze_feature = compute_gaze_feature(points_px, frame_gray=gray)
                 feature = build_feature_vector(
                     gaze_feature.vector,
                     (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),

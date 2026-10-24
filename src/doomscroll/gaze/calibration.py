@@ -45,6 +45,15 @@ MAX_LEAVE_ONE_GROUP_OUT_GROUPS = 20  # switch to GroupKFold beyond this many poi
 # strong on a model this small.
 DEFAULT_ALPHAS = tuple(np.logspace(-3, 2, 12))
 
+# Local-correction stage settings (see GazeCalibrator docstring). Bandwidth
+# is in the *scaled+poly feature space* (post-StandardScaler units), so
+# "1.5" roughly means "within about 1.5 standard deviations of feature
+# distance" gets meaningful weight, not 1.5 raw units of any particular
+# feature.
+LOCAL_CORRECTION_K = 8
+LOCAL_CORRECTION_BANDWIDTH = 1.5
+LOCAL_CORRECTION_MAX_WEIGHT = 0.5  # cap on how much of the local residual to trust, even at zero distance
+
 
 def build_feature_vector(
     gaze_vector: np.ndarray,
@@ -102,9 +111,35 @@ class GazeCalibrator:
     alpha_per_target) because sklearn's alpha_per_target optimization only
     applies to the default fast leave-one-out path, not to an explicit
     custom `cv` -- and a custom group-aware cv is exactly the point here.
+
+    Local residual correction on top: after fitting the global linear
+    model, this stores each training sample's residual (true target minus
+    the global model's prediction for it) alongside its transformed feature
+    vector. At prediction time, it finds the K nearest calibration samples
+    (in transformed feature space) to the live input and blends a
+    distance-weighted average of *their* residuals into the global
+    prediction -- weighted down to near-zero for a live input that's far
+    from any calibration sample, so it can only ever nudge the global
+    model's prediction, never override it far from real training data.
+    This is deliberately NOT a global nonlinear model (that's what the
+    rejected degree-2 polynomial was, and why it extrapolated so badly): it
+    can only correct in neighborhoods where enough real calibration data
+    actually exists, which is exactly where nonlinear correction is
+    trustworthy and where a global polynomial's extrapolation risk doesn't
+    apply. Conceptually similar to how some webcam gaze trackers blend a
+    coarse/robust estimate with a more precise local one -- this is our own
+    independent implementation of that general idea (KNN residual
+    blending), not borrowed code.
     """
 
-    def __init__(self, alphas: tuple[float, ...] = DEFAULT_ALPHAS, poly_degree: int = 1):
+    def __init__(
+        self,
+        alphas: tuple[float, ...] = DEFAULT_ALPHAS,
+        poly_degree: int = 1,
+        local_correction_k: int = LOCAL_CORRECTION_K,
+        local_correction_bandwidth: float = LOCAL_CORRECTION_BANDWIDTH,
+        local_correction_max_weight: float = LOCAL_CORRECTION_MAX_WEIGHT,
+    ):
         self._alphas = alphas
         self._preprocessor = Pipeline(
             [
@@ -115,6 +150,12 @@ class GazeCalibrator:
         self._ridge_x: RidgeCV | None = None
         self._ridge_y: RidgeCV | None = None
         self._fitted = False
+
+        self._local_k = local_correction_k
+        self._local_bandwidth = local_correction_bandwidth
+        self._local_max_weight = local_correction_max_weight
+        self._train_X: np.ndarray | None = None  # transformed training features, for neighbor search
+        self._train_residuals: np.ndarray | None = None  # (N, 2), true - global_pred on training data
 
     @property
     def is_fitted(self) -> bool:
@@ -159,16 +200,43 @@ class GazeCalibrator:
         self._ridge_y.fit(X, targets[:, 1])
         self._fitted = True
 
+        global_preds = np.column_stack([self._ridge_x.predict(X), self._ridge_y.predict(X)])
+        self._train_X = X
+        self._train_residuals = targets - global_preds
+
+    def _local_correction(self, X_query: np.ndarray) -> np.ndarray:
+        """X_query: (1, D) transformed feature vector. Returns a (2,)
+        correction to add to the global prediction -- zero if there's no
+        training data or the query is far from all of it."""
+        if self._train_X is None or len(self._train_X) < self._local_k:
+            return np.zeros(2)
+
+        dists = np.linalg.norm(self._train_X - X_query, axis=1)
+        nearest_idx = np.argsort(dists)[: self._local_k]
+        nearest_dists = dists[nearest_idx]
+
+        weights = np.exp(-(nearest_dists**2) / (2 * self._local_bandwidth**2))
+        weight_sum = float(weights.sum())
+        if weight_sum < 1e-8:
+            return np.zeros(2)  # too far from any calibration sample -- don't extrapolate locally
+
+        weighted_residual = (weights[:, None] * self._train_residuals[nearest_idx]).sum(axis=0) / weight_sum
+        # Confidence shrinks toward 0 as the closest neighbor gets farther
+        # away, capped at local_max_weight even at zero distance -- the
+        # global model always keeps at least half the say.
+        confidence = float(np.clip(weights.max(), 0.0, 1.0)) * self._local_max_weight
+        return confidence * weighted_residual
+
     def predict(self, feature: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("GazeCalibrator.predict() called before fit()/load()")
         X = self._preprocessor.transform(feature.reshape(1, -1))
-        return np.array([self._ridge_x.predict(X)[0], self._ridge_y.predict(X)[0]])
+        global_pred = np.array([self._ridge_x.predict(X)[0], self._ridge_y.predict(X)[0]])
+        return global_pred + self._local_correction(X)
 
     def validate(self, features: np.ndarray, targets: np.ndarray) -> float:
         """Mean Euclidean pixel error on held-out (features, targets)."""
-        X = self._preprocessor.transform(features)
-        predictions = np.column_stack([self._ridge_x.predict(X), self._ridge_y.predict(X)])
+        predictions = np.array([self.predict(f) for f in features])
         errors = np.linalg.norm(predictions - targets, axis=1)
         return float(np.mean(errors))
 
@@ -176,7 +244,16 @@ class GazeCalibrator:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
-            {"preprocessor": self._preprocessor, "ridge_x": self._ridge_x, "ridge_y": self._ridge_y},
+            {
+                "preprocessor": self._preprocessor,
+                "ridge_x": self._ridge_x,
+                "ridge_y": self._ridge_y,
+                "local_k": self._local_k,
+                "local_bandwidth": self._local_bandwidth,
+                "local_max_weight": self._local_max_weight,
+                "train_X": self._train_X,
+                "train_residuals": self._train_residuals,
+            },
             path,
         )
 
@@ -186,9 +263,15 @@ class GazeCalibrator:
         if not path.exists():
             raise FileNotFoundError(f"No calibration profile at {path}. Run scripts/calibrate.py first.")
         data = joblib.load(path)
-        instance = cls()
+        instance = cls(
+            local_correction_k=data.get("local_k", LOCAL_CORRECTION_K),
+            local_correction_bandwidth=data.get("local_bandwidth", LOCAL_CORRECTION_BANDWIDTH),
+            local_correction_max_weight=data.get("local_max_weight", LOCAL_CORRECTION_MAX_WEIGHT),
+        )
         instance._preprocessor = data["preprocessor"]
         instance._ridge_x = data["ridge_x"]
         instance._ridge_y = data["ridge_y"]
+        instance._train_X = data.get("train_X")
+        instance._train_residuals = data.get("train_residuals")
         instance._fitted = True
         return instance

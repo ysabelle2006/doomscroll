@@ -72,8 +72,12 @@ def test_selected_alpha_before_fit_raises():
 
 
 def test_validate_before_fit_raises():
+    """validate() now delegates to predict() per sample (so local
+    correction applies during validation too), so it raises the same clear
+    RuntimeError as predict()/selected_alpha rather than leaking sklearn's
+    internal NotFittedError."""
     calibrator = GazeCalibrator()
-    with pytest.raises(AttributeError):
+    with pytest.raises(RuntimeError):
         calibrator.validate(np.zeros((1, FEATURE_DIM)), np.zeros((1, 2)))
 
 
@@ -143,6 +147,59 @@ def test_calibration_accuracy_regression_benchmark():
         f"expected < {MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX}px. Run "
         "`python scripts/bench_calibration.py` for a detailed before/after comparison."
     )
+
+
+def test_local_correction_reduces_error_on_the_nonlinear_synthetic_benchmark():
+    """synthetic_calibration.py deliberately bakes in a small cubic
+    nonlinearity the degree-1 global model can't fit (see its module
+    docstring on _NONLINEARITY_COEF) -- exactly the regime the local KNN
+    residual correction exists for. Comparing against
+    local_correction_max_weight=0.0 (which makes _local_correction always
+    return zero, i.e. the old pre-local-correction behavior) isolates its
+    effect from everything else GazeCalibrator does."""
+    sess = generate_synthetic_session(seed=0)
+
+    baseline = GazeCalibrator(local_correction_max_weight=0.0)
+    baseline.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    baseline_err = baseline.validate(sess.val_features, sess.val_targets)
+
+    corrected = GazeCalibrator()
+    corrected.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    corrected_err = corrected.validate(sess.val_features, sess.val_targets)
+
+    assert corrected_err < baseline_err
+
+
+def test_local_correction_is_zero_far_from_any_training_sample():
+    """A live input far outside anything seen during calibration shouldn't
+    get nudged by nearby-but-irrelevant residuals -- it should fall back to
+    the pure global prediction, same as if local correction were absent."""
+    sess = generate_synthetic_session(seed=2)
+    calibrator = GazeCalibrator()
+    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+
+    far_feature = np.full(FEATURE_DIM, 1e6)
+    X_far = calibrator._preprocessor.transform(far_feature.reshape(1, -1))
+    np.testing.assert_allclose(calibrator._local_correction(X_far), np.zeros(2))
+
+
+def test_local_correction_survives_save_load_round_trip(tmp_path: Path):
+    """save()/load() must round-trip the local-correction training data
+    too, not just the ridge models -- otherwise a freshly-loaded calibrator
+    would silently lose the correction and predict differently than it did
+    right before saving."""
+    sess = generate_synthetic_session(seed=0)
+    calibrator = GazeCalibrator()
+    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    before = np.array([calibrator.predict(f) for f in sess.val_features])
+
+    profile_path = tmp_path / "profile.joblib"
+    calibrator.save(profile_path)
+    loaded = GazeCalibrator.load(profile_path)
+
+    assert loaded._train_X is not None and loaded._train_residuals is not None
+    after = np.array([loaded.predict(f) for f in sess.val_features])
+    np.testing.assert_allclose(after, before)
 
 
 # The pursuit protocol has an intentionally modeled, *higher* error floor

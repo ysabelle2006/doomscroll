@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from doomscroll.gaze.head_pose import HeadPose
-from scripts.calibrate import PoseVariant, _pose_variant_readout
+from scripts.calibrate import FRONT_YAW_PITCH_TOLERANCE_DEG, PoseVariant, _front_readout, _pose_variant_readout
 
 
 def _make_head_pose(yaw_deg: float = 0.0, pitch_deg: float = 0.0, z_mm: float = 400.0) -> HeadPose:
@@ -108,3 +108,39 @@ def test_default_pose_variants_each_have_exactly_one_range_set(label: str):
         r is not None for r in (variant.yaw_range, variant.pitch_range, variant.z_delta_range)
     )
     assert ranges_set == 1
+
+
+def test_front_readout_face_not_detected():
+    readout, straight = _front_readout(None)
+    assert readout == "face not detected"
+    assert straight is False
+
+
+def test_front_readout_straight_when_yaw_and_pitch_both_near_zero():
+    readout, straight = _front_readout(_make_head_pose(yaw_deg=2.0, pitch_deg=-3.0))
+    assert straight is True
+    assert "(straight)" in readout
+    assert "yaw=+2.0" in readout and "pitch=-3.0" in readout
+
+
+def test_front_readout_not_straight_when_yaw_exceeds_tolerance():
+    readout, straight = _front_readout(_make_head_pose(yaw_deg=FRONT_YAW_PITCH_TOLERANCE_DEG + 1.0, pitch_deg=0.0))
+    assert straight is False
+    assert "(not quite straight)" in readout
+
+
+def test_front_readout_not_straight_when_pitch_exceeds_tolerance():
+    readout, straight = _front_readout(_make_head_pose(yaw_deg=0.0, pitch_deg=-(FRONT_YAW_PITCH_TOLERANCE_DEG + 1.0)))
+    assert straight is False
+
+
+def test_front_readout_boundary_tolerance_counts_as_straight():
+    """Exactly at the tolerance boundary should still count as straight --
+    <= not <, matching _pose_variant_readout's own inclusive range checks."""
+    readout, straight = _front_readout(_make_head_pose(yaw_deg=FRONT_YAW_PITCH_TOLERANCE_DEG, pitch_deg=FRONT_YAW_PITCH_TOLERANCE_DEG))
+    assert straight is True
+
+
+def test_front_readout_reports_distance_in_mm():
+    readout, _ = _front_readout(_make_head_pose(z_mm=512.0))
+    assert "distance=512mm" in readout

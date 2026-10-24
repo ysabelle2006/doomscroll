@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from doomscroll.gaze.pupil_refine import refine_iris_center
 from doomscroll.landmarks.mediapipe_backend import LEFT_IRIS, RIGHT_IRIS
 
 LEFT_EYE_OUTER = 33
@@ -26,7 +27,7 @@ LEFT_EYE_BOTTOM = 145
 RIGHT_EYE_TOP = 386
 RIGHT_EYE_BOTTOM = 374
 
-DEFAULT_MIN_EYE_ASPECT_RATIO = 0.12
+DEFAULT_MIN_EYE_ASPECT_RATIO = 0.08
 
 
 @dataclass
@@ -34,10 +35,7 @@ class GazeFeature:
     vector: np.ndarray  # shape (4,): [mean_x, mean_y, diff_x, diff_y]
 
 
-def _eye_in_head_offset(points_px: np.ndarray, outer_idx: int, inner_idx: int, iris_idx: int) -> np.ndarray:
-    outer = points_px[outer_idx]
-    inner = points_px[inner_idx]
-    iris = points_px[iris_idx]
+def _eye_in_head_offset_from_px(outer: np.ndarray, inner: np.ndarray, iris: np.ndarray) -> np.ndarray:
     eye_center = (outer + inner) / 2.0
     eye_width = np.linalg.norm(outer - inner)
     if eye_width < 1e-6:
@@ -45,7 +43,7 @@ def _eye_in_head_offset(points_px: np.ndarray, outer_idx: int, inner_idx: int, i
     return (iris - eye_center) / eye_width
 
 
-def compute_gaze_feature(points_px: np.ndarray) -> GazeFeature:
+def compute_gaze_feature(points_px: np.ndarray, frame_gray: np.ndarray | None = None) -> GazeFeature:
     """Both eyes move together (conjugate eye movement), so their raw
     per-eye offsets are highly correlated -- feeding both directly into a
     Ridge fit is a collinearity problem: the model can split credit between
@@ -56,9 +54,32 @@ def compute_gaze_feature(points_px: np.ndarray) -> GazeFeature:
     well-conditioned conjugate signal; diff_offset isolates the much smaller
     residual (vergence/asymmetry) so it can't fight the dominant signal for
     credit -- same dimensionality (4), much better conditioned to regress on.
+
+    frame_gray: optional grayscale frame. When given, each eye's iris
+    position is first passed through pupil_refine.refine_iris_center() -- a
+    classical image-processing check/refinement layered on top of
+    MediaPipe's landmark, which falls back to the landmark unchanged
+    whenever the refinement doesn't pass its own confidence check. Pass
+    None (the default) to use the landmark position directly, e.g. for
+    callers without easy access to the raw frame.
     """
-    left = _eye_in_head_offset(points_px, LEFT_EYE_OUTER, LEFT_EYE_INNER, LEFT_IRIS_CENTER)
-    right = _eye_in_head_offset(points_px, RIGHT_EYE_OUTER, RIGHT_EYE_INNER, RIGHT_IRIS_CENTER)
+    left_outer, left_inner, left_iris = (
+        points_px[LEFT_EYE_OUTER],
+        points_px[LEFT_EYE_INNER],
+        points_px[LEFT_IRIS_CENTER],
+    )
+    right_outer, right_inner, right_iris = (
+        points_px[RIGHT_EYE_OUTER],
+        points_px[RIGHT_EYE_INNER],
+        points_px[RIGHT_IRIS_CENTER],
+    )
+
+    if frame_gray is not None:
+        left_iris = refine_iris_center(frame_gray, left_iris, left_outer, left_inner)
+        right_iris = refine_iris_center(frame_gray, right_iris, right_outer, right_inner)
+
+    left = _eye_in_head_offset_from_px(left_outer, left_inner, left_iris)
+    right = _eye_in_head_offset_from_px(right_outer, right_inner, right_iris)
     mean_offset = (left + right) / 2.0
     diff_offset = left - right
     return GazeFeature(vector=np.concatenate([mean_offset, diff_offset]))
