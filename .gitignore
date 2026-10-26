@@ -3,3 +3,6 @@
 **/doomscroll.egg-info
 **/.DS_Store
 **/.pytest_cache
+data/raw/
+models/*.safetensors
+ml/third_party/
