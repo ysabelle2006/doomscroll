@@ -10,10 +10,7 @@ Covers two things:
      fully-reproducible "did my change to calibration.py help or hurt"
      check, using a known ground-truth mapping (see synthetic_calibration.py)
      instead of a real human calibration session. A hard pytest fail here
-     means something broke badly; for a precise before/after comparison on
-     a *specific* change, use `python scripts/bench_calibration.py` instead
-     (see that script's docstring), which also works with a real recorded
-     calibration session if you have one.
+     means something broke badly.
 """
 from __future__ import annotations
 
@@ -22,7 +19,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from doomscroll.gaze.calibration import MIN_CALIBRATION_SAMPLES, FEATURE_DIM, GazeCalibrator, build_feature_vector
+from doomscroll.gaze.calibration import (
+    MIN_CALIBRATION_SAMPLES,
+    FEATURE_DIM,
+    GazeCalibrator,
+    build_feature_vector,
+    load_profile_for_backend,
+    profile_path_for_backend,
+)
 from tests.synthetic_calibration import (
     generate_protocol_comparison_session,
     generate_pursuit_session,
@@ -35,8 +39,7 @@ from tests.synthetic_calibration import (
 # several times that -- so ordinary seed-to-seed/version-to-version noise
 # never fails the build; it exists to catch a real regression (e.g. the
 # alpha search reaching for far more regularization than it should, which
-# empirically pushes this same benchmark's error past 200px). For a precise
-# "did it get better or worse" comparison, use scripts/bench_calibration.py.
+# empirically pushes this same benchmark's error past 200px).
 MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX = 40.0
 
 
@@ -144,8 +147,7 @@ def test_calibration_accuracy_regression_benchmark():
 
     assert mean_error_px < MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX, (
         f"Synthetic calibration accuracy regressed: {mean_error_px:.1f}px, "
-        f"expected < {MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX}px. Run "
-        "`python scripts/bench_calibration.py` for a detailed before/after comparison."
+        f"expected < {MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX}px."
     )
 
 
@@ -209,20 +211,19 @@ def test_local_correction_survives_save_load_round_trip(tmp_path: Path):
 # PURSUIT_LATENCY_S / PURSUIT_GAIN). That's the whole point of the model,
 # not a bug -- empirically this lands around 55-70px across seeds, vs.
 # ~10-12px for the still-point grid. This threshold (~2x the observed max)
-# exists only to catch a genuinely broken fit, not to compare protocols --
-# scripts/compare_calibration_protocols.py is the tool for that comparison.
+# exists only to catch a genuinely broken fit, not to compare protocols
+# against each other.
 MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX = 120.0
 
 
 def test_pursuit_session_fits_and_validates_without_error():
     """Sanity check for the cursor-pursuit protocol generator (see
     synthetic_calibration.py) -- this is deliberately NOT asserting pursuit
-    is better or worse than the still-point grid (that's the open question
-    scripts/compare_calibration_protocols.py exists to explore); it just
-    confirms the pursuit-shaped dataset is well-formed and GazeCalibrator
-    can fit/validate against it without error, within its own (higher,
-    intentionally-modeled) error floor -- see
-    MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX above."""
+    is better or worse than the still-point grid (that remains an open,
+    unautomated empirical question); it just confirms the pursuit-shaped
+    dataset is well-formed and GazeCalibrator can fit/validate against it
+    without error, within its own (higher, intentionally-modeled) error
+    floor -- see MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX above."""
     sess = generate_pursuit_session(seed=0)
     assert sess.train_features.shape[1] == FEATURE_DIM
     assert sess.train_features.shape[0] == sess.train_targets.shape[0] == sess.train_groups.shape[0]
@@ -236,6 +237,106 @@ def test_pursuit_session_fits_and_validates_without_error():
         f"Pursuit-protocol synthetic benchmark regressed: {mean_error_px:.1f}px, "
         f"expected < {MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX}px."
     )
+
+
+def test_save_load_round_trip_preserves_feature_backend(tmp_path: Path):
+    sess = generate_synthetic_session(seed=1)
+    calibrator = GazeCalibrator(feature_backend="l2cs")
+    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+
+    profile_path = tmp_path / "profile.joblib"
+    calibrator.save(profile_path)
+
+    loaded = GazeCalibrator.load(profile_path)
+    assert loaded.feature_backend == "l2cs"
+
+
+def test_default_feature_backend_is_handcrafted():
+    assert GazeCalibrator().feature_backend == "handcrafted"
+
+
+def test_load_defaults_feature_backend_for_old_style_saved_profile(tmp_path: Path):
+    """A profile saved before feature_backend existed has no such key in
+    its joblib dump at all -- load() must still succeed, defaulting to
+    "handcrafted" (the only backend that existed at the time), rather than
+    raising a KeyError."""
+    sess = generate_synthetic_session(seed=1)
+    calibrator = GazeCalibrator()
+    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+
+    profile_path = tmp_path / "profile.joblib"
+    calibrator.save(profile_path)
+
+    import joblib
+
+    data = joblib.load(profile_path)
+    del data["feature_backend"]
+    joblib.dump(data, profile_path)
+
+    loaded = GazeCalibrator.load(profile_path)
+    assert loaded.feature_backend == "handcrafted"
+
+
+def test_profile_path_for_backend_is_distinct_per_backend(tmp_path: Path):
+    handcrafted_path = profile_path_for_backend("handcrafted", tmp_path)
+    l2cs_path = profile_path_for_backend("l2cs", tmp_path)
+    assert handcrafted_path != l2cs_path
+    assert handcrafted_path.parent == tmp_path == l2cs_path.parent
+
+
+def test_load_profile_for_backend_round_trips_without_cross_backend_overwrite(tmp_path: Path):
+    """The bug this whole helper exists to fix: calibrating handcrafted
+    then l2cs (or vice versa) must leave BOTH profiles loadable
+    afterward, neither clobbered by the other -- unlike the old shared
+    DEFAULT_PROFILE_PATH, which only ever held whichever backend was
+    calibrated most recently."""
+    sess = generate_synthetic_session(seed=1)
+
+    handcrafted = GazeCalibrator(feature_backend="handcrafted")
+    handcrafted.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    handcrafted.save(profile_path_for_backend("handcrafted", tmp_path))
+
+    l2cs = GazeCalibrator(feature_backend="l2cs")
+    l2cs.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    l2cs.save(profile_path_for_backend("l2cs", tmp_path))
+
+    loaded_handcrafted = load_profile_for_backend("handcrafted", tmp_path)
+    loaded_l2cs = load_profile_for_backend("l2cs", tmp_path)
+    assert loaded_handcrafted.feature_backend == "handcrafted"
+    assert loaded_l2cs.feature_backend == "l2cs"
+
+
+def test_load_profile_for_backend_raises_clearly_when_nothing_saved(tmp_path: Path):
+    with pytest.raises(FileNotFoundError, match="calibrate.py --features l2cs"):
+        load_profile_for_backend("l2cs", tmp_path)
+
+
+def test_load_profile_for_backend_falls_back_to_matching_legacy_profile(tmp_path: Path):
+    """An install from before per-backend paths existed has everything in
+    the single legacy default.joblib. load_profile_for_backend() should
+    still find it, as long as its own stored tag matches what's asked
+    for -- so existing users aren't forced to recalibrate just because
+    this helper was introduced."""
+    sess = generate_synthetic_session(seed=1)
+    legacy = GazeCalibrator(feature_backend="l2cs")
+    legacy.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    legacy.save(tmp_path / "default.joblib")
+
+    loaded = load_profile_for_backend("l2cs", tmp_path)
+    assert loaded.feature_backend == "l2cs"
+
+
+def test_load_profile_for_backend_never_falls_back_to_mismatched_legacy_profile(tmp_path: Path):
+    """The legacy fallback must not resurrect the overwrite bug: a legacy
+    default.joblib tagged 'l2cs' must never be silently handed back for a
+    'handcrafted' request just because it's the only file sitting there."""
+    sess = generate_synthetic_session(seed=1)
+    legacy = GazeCalibrator(feature_backend="l2cs")
+    legacy.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
+    legacy.save(tmp_path / "default.joblib")
+
+    with pytest.raises(FileNotFoundError):
+        load_profile_for_backend("handcrafted", tmp_path)
 
 
 def test_protocol_comparison_session_shapes_are_consistent():

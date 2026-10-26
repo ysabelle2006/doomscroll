@@ -51,10 +51,11 @@ MAX_POOLED_SESSIONS = 3
 @dataclass
 class CalibrationSession:
     timestamp: float
-    features: np.ndarray  # (N, FEATURE_DIM)
+    features: np.ndarray  # (N, FEATURE_DIM) -- width depends on feature_backend, see calibration.py
     targets: np.ndarray  # (N, 2) screen px
     groups: np.ndarray  # (N,) calibration-point id, unique within this session
     screen_size: tuple[int, int]
+    feature_backend: str = "handcrafted"  # which gaze-feature pipeline captured `features` -- see calibration.py
 
     @property
     def label(self) -> str:
@@ -66,6 +67,7 @@ def save_session(
     targets: np.ndarray,
     groups: np.ndarray,
     screen_size: tuple[int, int],
+    feature_backend: str = "handcrafted",
 ) -> Path:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = time.time()
@@ -85,6 +87,7 @@ def save_session(
             "targets": targets,
             "groups": groups,
             "screen_size": screen_size,
+            "feature_backend": feature_backend,
         },
         path,
     )
@@ -108,6 +111,9 @@ def list_sessions() -> list[CalibrationSession]:
                 targets=data["targets"],
                 groups=data["groups"],
                 screen_size=tuple(data["screen_size"]),
+                # Sessions saved before this field existed were all captured
+                # with the (only, at the time) hand-crafted feature pipeline.
+                feature_backend=data.get("feature_backend", "handcrafted"),
             )
         )
     sessions.sort(key=lambda s: s.timestamp, reverse=True)
@@ -115,18 +121,32 @@ def list_sessions() -> list[CalibrationSession]:
 
 
 def pool_sessions(
-    sessions: list[CalibrationSession], screen_size: tuple[int, int], max_sessions: int = MAX_POOLED_SESSIONS
+    sessions: list[CalibrationSession],
+    screen_size: tuple[int, int],
+    max_sessions: int = MAX_POOLED_SESSIONS,
+    feature_backend: str = "handcrafted",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[CalibrationSession]]:
     """Concatenates the most recent `max_sessions` sessions whose screen
-    size matches the current one, remapping group ids to stay globally
-    unique. Returns (features, targets, groups, sessions_actually_used).
+    size AND feature backend match the current ones, remapping group ids to
+    stay globally unique. Returns (features, targets, groups, sessions_actually_used).
 
     Sessions recorded at a different screen resolution are skipped
     entirely: their targets are in pixel coordinates of a different-sized
     screen, so pooling them would train the model toward positions that
     don't correspond to anything on the current display.
+
+    Sessions captured with a different feature_backend are skipped for the
+    same reason, one level down: their feature vectors have a different
+    width/meaning entirely (e.g. a hand-crafted 10-dim eye-vector+head-pose
+    sample vs an L2CS-Net 8-dim appearance+head-pose one -- see
+    calibration.py's FEATURE_DIMS), so concatenating them wouldn't train
+    toward a shared mapping, it would either crash on a shape mismatch or,
+    worse, happen to share a width by coincidence and silently train on
+    nonsense. Pick one backend's pass of calibrate.py and stick with it.
     """
-    usable = [s for s in sessions if s.screen_size == screen_size][:max_sessions]
+    usable = [s for s in sessions if s.screen_size == screen_size and s.feature_backend == feature_backend][
+        :max_sessions
+    ]
     if not usable:
         return np.empty((0,)), np.empty((0,)), np.empty((0,)), []
 

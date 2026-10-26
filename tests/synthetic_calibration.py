@@ -1,6 +1,5 @@
-"""Synthetic calibration session generator, used by both the pytest
-accuracy-regression test (test_calibration.py) and the standalone
-scripts/bench_calibration.py benchmark.
+"""Synthetic calibration session generator, used by the pytest
+accuracy-regression tests in test_calibration.py.
 
 A real calibration session needs a webcam and a human in front of it, which
 a test suite can't provide -- so this instead builds feature vectors from a
@@ -208,9 +207,8 @@ def _generate_validation_samples(
 # "cursor position = calibration label" for every captured frame bakes
 # this lag/undershoot in as label noise/bias the model can never fit away.
 # That is modeled explicitly below via PURSUIT_LATENCY_S / PURSUIT_GAIN,
-# rather than silently assumed away -- adjust them (or pass --latency /
-# --gain to scripts/compare_calibration_protocols.py) if you think your
-# actual tracking is better or worse than this assumption, since the
+# rather than silently assumed away -- adjust them directly if you think
+# your actual tracking is better or worse than this assumption, since the
 # conclusion is sensitive to them.
 PURSUIT_LATENCY_S = 0.12
 PURSUIT_GAIN = 0.90
@@ -301,10 +299,9 @@ def generate_pursuit_session(seed: int = 0, screen_w: int = 1920, screen_h: int 
     """Drop-in alternative to generate_synthetic_session() using the
     continuous cursor-pursuit protocol instead of the discrete still-point
     grid for TRAINING data (validation uses the identical still-point
-    VALIDATION_FRACTIONS set) -- so scripts/bench_calibration.py's existing
-    "did my change to calibration.py help or hurt" workflow
-    (--synthetic --protocol pursuit) works unchanged against pursuit-shaped
-    data too."""
+    VALIDATION_FRACTIONS set) -- lets the "did my change to calibration.py
+    help or hurt" question (see test_calibration.py) be asked against
+    pursuit-shaped data too, not just the still-point grid."""
     rng = np.random.default_rng(seed)
 
     n_samples = int(round(PURSUIT_DURATION_S * PURSUIT_SAMPLE_HZ))
@@ -333,8 +330,7 @@ def generate_pursuit_session(seed: int = 0, screen_w: int = 1920, screen_h: int 
 class ProtocolComparisonSession:
     """Still-point vs. cursor-pursuit TRAINING data, paired with ONE shared
     validation set so both can be fairly compared -- see
-    generate_protocol_comparison_session() and
-    scripts/compare_calibration_protocols.py."""
+    generate_protocol_comparison_session()."""
 
     screen_w: int
     screen_h: int
@@ -355,8 +351,10 @@ def generate_protocol_comparison_session(
     RNG streams (via SeedSequence.spawn, not just two different loops
     sharing one generator) so adding/removing samples from one protocol can
     never shift the other's random draws, plus a THIRD independent stream
-    for a validation set shared, bit-for-bit, by both -- the fair, paired
-    comparison scripts/compare_calibration_protocols.py reports on."""
+    for a validation set shared, bit-for-bit, by both -- for a fair, paired
+    comparison between the two protocols (see
+    test_protocol_comparison_session_shapes_are_consistent in
+    test_calibration.py)."""
     seed_seq = np.random.SeedSequence(seed)
     still_rng, pursuit_rng, val_rng = (np.random.default_rng(s) for s in seed_seq.spawn(3))
 

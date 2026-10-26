@@ -31,6 +31,24 @@ CALIBRATION_DIR = Path(user_data_dir("gazescroll")) / "calibration"
 DEFAULT_PROFILE_PATH = CALIBRATION_DIR / "default.joblib"
 
 FEATURE_DIM = 10  # 4 (eye-in-head) + 3 (yaw, pitch, roll) + 3 (head translation x,y,z mm)
+
+# Per-backend feature-vector widths (see src/doomscroll/gaze/l2cs_backend.py for the
+# "l2cs" one, and gaze_vector.py for "handcrafted"): both put a gaze signal first,
+# then the same 6-dim head rotation+translation tail via build_feature_vector(), just
+# with a different leading-gaze-vector width -- 4 (eye-in-head offset) for the
+# original hand-crafted features, kept as FEATURE_DIM above for backward
+# compatibility with any code/tests that import that name directly, vs 2
+# (L2CS-Net's pretrained yaw/pitch) for the appearance-based alternative. Every
+# GazeCalibrator profile and stored calibration session now tags which backend
+# produced it (see feature_backend below / session_store.py) specifically so a
+# profile calibrated with one backend can't silently be fed mismatched-dimension
+# live features from the other -- see calibrate.py/phase2_gaze_scroll.py's
+# --features flag and the clear error they raise on a mismatch, rather than
+# whatever sklearn's own shape-mismatch exception would otherwise say.
+FEATURE_DIM_HANDCRAFTED = FEATURE_DIM
+FEATURE_DIM_L2CS = 8
+FEATURE_DIMS: dict[str, int] = {"handcrafted": FEATURE_DIM_HANDCRAFTED, "l2cs": FEATURE_DIM_L2CS}
+
 MIN_CALIBRATION_SAMPLES = 30
 MAX_LEAVE_ONE_GROUP_OUT_GROUPS = 20  # switch to GroupKFold beyond this many points
 
@@ -139,7 +157,14 @@ class GazeCalibrator:
         local_correction_k: int = LOCAL_CORRECTION_K,
         local_correction_bandwidth: float = LOCAL_CORRECTION_BANDWIDTH,
         local_correction_max_weight: float = LOCAL_CORRECTION_MAX_WEIGHT,
+        feature_backend: str = "handcrafted",
     ):
+        # Purely a label carried alongside the fit (save()/load() persist it,
+        # calibrate.py/phase2_gaze_scroll.py check it) -- fit()/predict() stay
+        # dimension-agnostic exactly as before, since GazeCalibrator itself
+        # never hardcodes a feature width, it just goes by whatever
+        # features.shape[1] actually is.
+        self.feature_backend = feature_backend
         self._alphas = alphas
         self._preprocessor = Pipeline(
             [
@@ -253,6 +278,7 @@ class GazeCalibrator:
                 "local_max_weight": self._local_max_weight,
                 "train_X": self._train_X,
                 "train_residuals": self._train_residuals,
+                "feature_backend": self.feature_backend,
             },
             path,
         )
@@ -267,6 +293,9 @@ class GazeCalibrator:
             local_correction_k=data.get("local_k", LOCAL_CORRECTION_K),
             local_correction_bandwidth=data.get("local_bandwidth", LOCAL_CORRECTION_BANDWIDTH),
             local_correction_max_weight=data.get("local_max_weight", LOCAL_CORRECTION_MAX_WEIGHT),
+            # Profiles saved before this field existed were all captured with
+            # the (only, at the time) hand-crafted feature pipeline.
+            feature_backend=data.get("feature_backend", "handcrafted"),
         )
         instance._preprocessor = data["preprocessor"]
         instance._ridge_x = data["ridge_x"]
@@ -275,3 +304,53 @@ class GazeCalibrator:
         instance._train_residuals = data.get("train_residuals")
         instance._fitted = True
         return instance
+
+
+# --- Per-backend profile paths -----------------------------------------
+#
+# GazeCalibrator.save()/load() themselves stay backend-agnostic (plain
+# path in, path out) -- the policy of WHICH path a given --features value
+# maps to lives here instead, so scripts/calibrate.py and
+# scripts/phase2_gaze_scroll.py share one definition of it rather than each
+# hardcoding (or, as before this existed, both just using
+# DEFAULT_PROFILE_PATH unconditionally -- which meant calibrating with one
+# backend silently overwrote the other's saved profile, and
+# phase2_gaze_scroll.py had no way to automatically pick up the right one
+# for whichever --features you passed it). With this, the two backends are
+# fully interchangeable from run to run: `phase2_gaze_scroll.py --features
+# l2cs` today and `--features handcrafted` tomorrow each load their own
+# profile, with no recalibration needed just because you switched.
+
+
+def profile_path_for_backend(feature_backend: str, calibration_dir: Path = CALIBRATION_DIR) -> Path:
+    """The saved-profile path for a given --features value -- e.g.
+    default_handcrafted.joblib / default_l2cs.joblib, never the shared
+    DEFAULT_PROFILE_PATH. calibrate.py saves here; phase2_gaze_scroll.py
+    (via load_profile_for_backend() below) loads from here."""
+    return Path(calibration_dir) / f"default_{feature_backend}.joblib"
+
+
+def load_profile_for_backend(feature_backend: str, calibration_dir: Path = CALIBRATION_DIR) -> "GazeCalibrator":
+    """Loads the saved profile for `feature_backend`, with one narrow
+    backward-compat fallback: an install that calibrated before per-backend
+    profile paths existed has everything in the single legacy
+    DEFAULT_PROFILE_PATH. If the new per-backend file isn't there yet but
+    that legacy file is, AND its own stored feature_backend tag matches
+    what's being asked for, use it rather than forcing an unnecessary
+    recalibration. Never falls back to a legacy file tagged with the OTHER
+    backend -- that would silently resurrect exactly the overwrite problem
+    this function exists to fix."""
+    path = profile_path_for_backend(feature_backend, calibration_dir)
+    if path.exists():
+        return GazeCalibrator.load(path)
+
+    legacy_path = Path(calibration_dir) / "default.joblib"
+    if legacy_path.exists():
+        legacy = GazeCalibrator.load(legacy_path)
+        if legacy.feature_backend == feature_backend:
+            return legacy
+
+    raise FileNotFoundError(
+        f"No calibration profile for --features {feature_backend!r} at {path}. "
+        f"Run `python scripts/calibrate.py --features {feature_backend}` first."
+    )
