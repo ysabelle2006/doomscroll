@@ -4,6 +4,8 @@ Privacy & Security). Not exercised on the Windows dev machine — validate on
 macOS before relying on it."""
 from __future__ import annotations
 
+import os
+
 from doomscroll.windowing.base import WindowBounds, WindowBoundsProvider
 
 try:
@@ -32,6 +34,23 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
         if frontmost_app is None:
             return None
         frontmost_pid = frontmost_app.processIdentifier()
+
+        if frontmost_pid == os.getpid():
+            # This very process (the gaze-tracking script itself -- its
+            # webcam preview window, most likely) is the frontmost
+            # application. Reporting one of our own windows back as "the
+            # focused window" would mean OCR, the live overlay, and the
+            # scroll trigger all start reasoning about our own debug
+            # window instead of whatever the user is actually reading.
+            # Report "no focused window" instead, so callers fall back to
+            # whatever external window was last genuinely focused.
+            #
+            # (This used to be guarded by comparing a window *title*
+            # against kCGWindowOwnerName below, which is actually the
+            # owning *application's* name, e.g. "Python" -- never a
+            # window title -- so that comparison could never match and
+            # this case was never actually caught.)
+            return None
 
         window_list = CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly, kCGNullWindowID

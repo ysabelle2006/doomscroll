@@ -46,7 +46,7 @@ import numpy as np
 MAX_DT_S = 0.25
 
 
-def make_kalman_filter(process_var: float = 50.0, measurement_var: float = 0.2) -> cv2.KalmanFilter:
+def make_kalman_filter(process_var: float = 20.0, measurement_var: float = 0.5) -> cv2.KalmanFilter:
     """4-state constant-velocity Kalman filter: state [x, y, vx, vy], measuring [x, y].
 
     process_var: how much the filter trusts its own motion model (higher =
@@ -83,9 +83,17 @@ class KalmanSmoother:
     (a standard robust-Kalman technique) clips how far a single measurement
     can pull the state before correct() is applied, bounding that damage
     while leaving normal smooth-motion tracking unaffected.
+
+    This project's own defaults have since moved further from EyeTrax's in
+    the same direction, for the same reason: process_var lower and
+    measurement_var higher than EyeTrax's own values means the filter
+    leans more on its motion model and less on each individual noisy
+    measurement -- less responsive, but visibly less jittery, which is
+    what this project's content-aware dwell tracking (gaze needs to sit
+    still on one spot to register as "read") actually benefits from.
     """
 
-    def __init__(self, process_var: float = 50.0, measurement_var: float = 0.2, max_innovation: float = 120.0):
+    def __init__(self, process_var: float = 20.0, measurement_var: float = 0.5, max_innovation: float = 120.0):
         self._process_var = process_var
         self._measurement_var = measurement_var
         self._max_innovation = max_innovation
@@ -145,10 +153,10 @@ class GazePointSmoother(KalmanSmoother):
 
     def __init__(
         self,
-        process_var: float = 50.0,
-        measurement_var: float = 0.2,
+        process_var: float = 20.0,
+        measurement_var: float = 0.5,
         max_innovation: float = 120.0,
-        ema_alpha: float = 0.25,
+        ema_alpha: float = 0.5,
     ):
         super().__init__(process_var, measurement_var, max_innovation)
         if not 0.0 <= ema_alpha <= 1.0:
