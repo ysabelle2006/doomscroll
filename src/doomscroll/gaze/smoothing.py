@@ -1,0 +1,174 @@
+"""Kalman filtering for the mapped screen-space gaze point.
+
+Adapted from EyeTrax's filter design
+(https://github.com/ck-zhang/EyeTrax/tree/master/src/eyetrax/filters):
+a 4-state constant-velocity model ([x, y, vx, vy], measuring [x, y]),
+optionally followed by a light EMA pass (their KalmanEMASmoother). This
+replaces an earlier median+EMA heuristic -- a properly modeled Kalman
+filter is the more principled way to satisfy "incidental head movement
+should not throw off gaze-position estimation": process/measurement noise
+are tuned as an explicit trust tradeoff rather than an ad hoc deadband, and
+the velocity state lets the filter anticipate smooth motion while damping
+single-frame jumps.
+
+Two further deviations from EyeTrax's reference implementation, both found
+empirically while tuning this against live tracking that was drifting to
+screen corners even with steady gaze:
+
+1. EyeTrax's transition matrix assumes a fixed dt=1.0 per call. This
+   project's capture loop doesn't run at a fixed rate, so
+   KalmanSmoother.update() sets dt from the actual elapsed time between
+   frames -- but dt is now also clamped to a maximum, since an unclamped
+   dt during a processing hiccup (a blink, a slow inference tick) makes the
+   constant-velocity extrapolation overconfident: position error from
+   accumulated velocity noise grows linearly with dt, while an unscaled
+   processNoiseCov doesn't account for the extra elapsed-time uncertainty.
+2. EyeTrax's step() returns kf.predict()'s pre-correction output rather
+   than the state after kf.correct(measurement) incorporates the fresh
+   measurement. That's a reasonable choice for a live cursor prioritizing
+   low perceived latency (predict where you'll be next, don't wait for
+   correction), but it trades away stability: if the velocity state is ever
+   noisy, the displayed point extrapolates from that noise every frame
+   before correction ever reins it back in. doomscroll's dwell trigger cares
+   about stability far more than latency, so this returns the corrected
+   (post-measurement) state instead.
+"""
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+# Cap dt so a processing hiccup (a blink, a slow inference tick) can't make
+# the constant-velocity extrapolation overconfident -- position uncertainty
+# from accumulated velocity noise grows with dt, and clamping it bounds the
+# worst case rather than letting one long gap between frames blow up the
+# prediction.
+MAX_DT_S = 0.25
+
+
+def make_kalman_filter(process_var: float = 50.0, measurement_var: float = 0.2) -> cv2.KalmanFilter:
+    """4-state constant-velocity Kalman filter: state [x, y, vx, vy], measuring [x, y].
+
+    process_var: how much the filter trusts its own motion model (higher =
+    follows measurements more readily, less lag, more residual jitter).
+    measurement_var: how much it trusts each raw measurement (higher = more
+    smoothing/lag). dt (the transition matrix's velocity coupling) is set
+    per-call in KalmanSmoother.update() rather than fixed here.
+    """
+    kf = cv2.KalmanFilter(4, 2)
+    kf.transitionMatrix = np.array(
+        [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32
+    )
+    kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_var
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_var
+    kf.errorCovPost = np.eye(4, dtype=np.float32)
+    kf.statePre = np.zeros((4, 1), np.float32)
+    kf.statePost = np.zeros((4, 1), np.float32)
+    return kf
+
+
+class KalmanSmoother:
+    """Kalman-filtered gaze point (extends EyeTrax's KalmanSmoother design
+    with innovation gating).
+
+    EyeTrax's default measurement_var=0.2 trusts each raw measurement
+    heavily, which is appropriate for a live gaze-cursor use case prioritizing
+    responsiveness. doomscroll's dwell/pattern-based scroll trigger cares more
+    about rejecting single-frame outliers (a blink-corrupted landmark, a
+    brief head jerk) than about minimizing lag -- and naive Kalman correction
+    is actually worse than no filtering for that: an outlier measurement gets
+    absorbed into the *velocity* state too, causing the filter to overshoot
+    even further on the *next* frame while it "catches up". Innovation gating
+    (a standard robust-Kalman technique) clips how far a single measurement
+    can pull the state before correct() is applied, bounding that damage
+    while leaving normal smooth-motion tracking unaffected.
+    """
+
+    def __init__(self, process_var: float = 50.0, measurement_var: float = 0.2, max_innovation: float = 120.0):
+        self._process_var = process_var
+        self._measurement_var = measurement_var
+        self._max_innovation = max_innovation
+        self._kf = make_kalman_filter(process_var, measurement_var)
+        self._initialized = False
+        self._last_timestamp_ms: int | None = None
+
+    def update(self, point: np.ndarray, timestamp_ms: int | None = None) -> np.ndarray:
+        meas = np.array([[float(point[0])], [float(point[1])]], dtype=np.float32)
+
+        if not self._initialized:
+            self._kf.statePre[:2] = meas
+            self._kf.statePost[:2] = meas
+            self._initialized = True
+            self._last_timestamp_ms = timestamp_ms
+            return np.array([point[0], point[1]], dtype=np.float64)
+
+        dt_s = 1.0
+        if timestamp_ms is not None and self._last_timestamp_ms is not None:
+            dt_s = min(max((timestamp_ms - self._last_timestamp_ms) / 1000.0, 1e-3), MAX_DT_S)
+            self._kf.transitionMatrix[0, 2] = dt_s
+            self._kf.transitionMatrix[1, 3] = dt_s
+            # Scale process noise with dt: more elapsed time between
+            # measurements means more genuine uncertainty in where the
+            # constant-velocity model's extrapolation actually lands.
+            self._kf.processNoiseCov = np.eye(4, dtype=np.float32) * self._process_var * dt_s
+        self._last_timestamp_ms = timestamp_ms
+
+        predicted = self._kf.predict()
+
+        if self._max_innovation is not None:
+            innovation = meas[:, 0] - predicted[:2, 0]
+            innovation_norm = float(np.linalg.norm(innovation))
+            if innovation_norm > self._max_innovation:
+                scale = self._max_innovation / innovation_norm
+                meas = (predicted[:2] + (innovation * scale).reshape(2, 1)).astype(np.float32)
+
+        self._kf.correct(meas)
+        # Return the corrected (post-measurement) state, not predict()'s
+        # pre-correction output -- see module docstring for why.
+        return np.array([self._kf.statePost[0, 0], self._kf.statePost[1, 0]], dtype=np.float64)
+
+    def reset(self) -> None:
+        self._kf = make_kalman_filter(self._process_var, self._measurement_var)
+        self._initialized = False
+        self._last_timestamp_ms = None
+
+
+class GazePointSmoother(KalmanSmoother):
+    """Kalman output run through a light EMA on top (mirrors EyeTrax's
+    KalmanEMASmoother) for extra smoothness. Kept as the project's default
+    smoother name for drop-in compatibility with existing call sites.
+
+    ema_alpha: 0.0 disables the EMA pass (pure Kalman output); closer to
+    1.0 means stronger smoothing and more lag.
+    """
+
+    def __init__(
+        self,
+        process_var: float = 50.0,
+        measurement_var: float = 0.2,
+        max_innovation: float = 120.0,
+        ema_alpha: float = 0.25,
+    ):
+        super().__init__(process_var, measurement_var, max_innovation)
+        if not 0.0 <= ema_alpha <= 1.0:
+            raise ValueError(f"ema_alpha must be in [0.0, 1.0], got {ema_alpha}")
+        self._ema_alpha = ema_alpha
+        self._ema_point: np.ndarray | None = None
+
+    def update(self, point: np.ndarray, timestamp_ms: int | None = None) -> np.ndarray:
+        kalman_point = super().update(point, timestamp_ms)
+
+        a = self._ema_alpha
+        if a == 0.0:
+            return kalman_point
+
+        if self._ema_point is None:
+            self._ema_point = kalman_point.copy()
+        else:
+            self._ema_point = a * self._ema_point + (1.0 - a) * kalman_point
+        return self._ema_point
+
+    def reset(self) -> None:
+        super().reset()
+        self._ema_point = None

@@ -1,28 +1,17 @@
-"""Record one data-collection session: webcam video + cursor position and
-mouse-button state at every frame (+ optional screen recording), one clock.
+"""Record one data-collection session: webcam video + cursor position at
+every frame (+ optional screen recording), all on one clock.
 
-    python scripts/record_session.py --participant nicole --activity game:osu --duration 600
+    python scripts/record_session.py --participant nicole --duration 300
     python scripts/record_session.py --participant nicole --screen --notes "head turned left"
 
-CONTROLS (global, work while the game has focus):  F8 = stop,  F9 = pause/resume.
-Pause during menus, loading screens, cutscenes, chat -- anything where you are
-not looking at the cursor. Paused frames are excluded from training.
-
-PICK GAMES WHERE THE CURSOR IS A REAL POINTER (this decides data quality):
-  GOOD: point-and-click / mouse-driven games, strategy (RTS, city builders),
-        card games, rhythm/aim trainers (osu!), puzzle, browser games, map-based
-        games -- you look where you click and the cursor roams the whole screen.
-  BAD:  first/third-person games with mouse-look. The game locks the cursor to
-        the centre, so the cursor position says nothing about where you look.
-        Also bad: gamepad games (no cursor), fast flick-aiming shooters.
-  Run the game WINDOWED or BORDERLESS (not exclusive fullscreen), on the same
-  monitor the camera sits at, so cursor coordinates match the screen size.
-
-ALSO FOR GOOD DATA:
-  * Vary your head: separate sessions with head forward, turned, tilted,
-    closer/further, noted in --notes. Vary lighting and glasses too.
-  * Don't use the keyboard-only parts of a game for long stretches.
-Ctrl+C or F8 stops; the partial session is kept.
+HOW TO COLLECT GOOD DATA (this matters more than any model choice):
+  * Look AT the cursor the whole time and keep moving it -- sweep corners,
+    edges, zig-zags, slow and fast. Frames where the cursor is idle are discarded.
+  * Vary your head: do separate sessions (or segments) with head forward,
+    turned left/right, tilted up/down, leaning closer/further, and say so in --notes.
+  * Vary conditions across sessions: lighting, glasses on/off, time of day.
+  * Don't touch the keyboard/mouse in ways that pull your eyes from the cursor.
+Ctrl+C stops early; the partial session is kept.
 """
 from __future__ import annotations
 
@@ -39,9 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.capture.webcam import WebcamSource
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
-from doomscroll.ml.labels import cursor_quality_warnings
-from doomscroll.ml.dataset import read_frame_log
-from doomscroll.recording.recorder import HotkeyControls, PynputCursor, Recorder
+from doomscroll.recording.recorder import PynputCursor, Recorder
 from doomscroll.recording.session import SessionMeta, SessionPaths
 
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "data" / "recordings"
@@ -56,7 +43,6 @@ def main() -> None:
     ap.add_argument("--screen", action="store_true", help="also record the screen (optional, not needed for training)")
     ap.add_argument("--preview", action="store_true", help="show a small webcam preview (press q in it to stop)")
     ap.add_argument("--notes", default="", help="free text: lighting, glasses, head pose for this session")
-    ap.add_argument("--activity", default="free", help="what you'll be doing, e.g. 'game:osu' (saved in meta.json)")
     ap.add_argument("--countdown", type=int, default=5)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
@@ -65,8 +51,7 @@ def main() -> None:
     screen_w, screen_h = get_screen_size()
     safe_name = re.sub(r"[^A-Za-z0-9_-]", "", args.participant)
     session_id = f"{safe_name}_{datetime.now():%Y%m%d_%H%M%S}"
-    meta = SessionMeta(session_id, args.participant, screen_w, screen_h, camera_index=args.camera, notes=args.notes,
-                       activity=args.activity)
+    meta = SessionMeta(session_id, args.participant, screen_w, screen_h, camera_index=args.camera, notes=args.notes)
     paths = SessionPaths(args.out / session_id)
 
     last_print = [0.0]
@@ -74,38 +59,28 @@ def main() -> None:
     def on_frame(idx: int, t_ms: float, frame) -> bool:
         if t_ms - last_print[0] >= 1000:
             last_print[0] = t_ms
-            state = "PAUSED" if controls.paused else "rec   "
-            print(f"\r  {state} {t_ms / 1000:6.1f}s / {args.duration:.0f}s   frames={idx + 1}   fps={(idx + 1) / (t_ms / 1000):4.1f}", end="", flush=True)
+            print(f"\r  {t_ms / 1000:6.1f}s / {args.duration:.0f}s   frames={idx + 1}   fps={(idx + 1) / (t_ms / 1000):4.1f}", end="", flush=True)
         if args.preview:
             small = cv2.resize(frame, (PREVIEW_WIDTH, int(frame.shape[0] * PREVIEW_WIDTH / frame.shape[1])))
             cv2.imshow("recording (q to stop)", small)
             return (cv2.waitKey(1) & 0xFF) == ord("q")
         return False
 
-    controls = HotkeyControls()
-    cursor = PynputCursor()
     print(f"Screen {screen_w}x{screen_h}. Session: {session_id}")
     with WebcamSource(args.camera) as cam:
         for n in range(args.countdown, 0, -1):
-            print(f"Starting in {n}...  (F8 stop, F9 pause)")
+            print(f"Starting in {n}...  (look at the cursor and keep moving it)")
             time.sleep(1)
-        recorder = Recorder(cam, cursor, paths, meta, record_screen=args.screen, on_frame=on_frame,
-                            is_paused=lambda: controls.paused)
+        recorder = Recorder(cam, PynputCursor(), paths, meta, record_screen=args.screen, on_frame=on_frame)
         try:
-            meta = recorder.run(args.duration, should_stop=lambda: controls.stop_requested)
+            meta = recorder.run(args.duration)
         except KeyboardInterrupt:
             meta = paths.read_meta()  # Recorder's finally-block already saved it
-        finally:
-            controls.close()
-            cursor.close()
     cv2.destroyAllWindows()
 
     print(f"\nSaved {meta.n_frames} frames, {meta.duration_s:.0f}s, {meta.measured_fps:.1f} fps -> {paths.dir}")
     if meta.measured_fps and meta.measured_fps < 15:
         print("WARNING: low fps. Close heavy apps / lower resolution; <15 fps makes eye tracking poor.")
-    t_ms, xy, _down, _active = read_frame_log(paths.frames_csv)
-    for w in cursor_quality_warnings(t_ms, xy, (screen_w, screen_h)):
-        print(f"WARNING: {w}")
     if meta.extra.get("screen_error"):
         print(f"WARNING: screen recording failed: {meta.extra['screen_error']}")
 

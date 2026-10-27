@@ -8,9 +8,11 @@ which has to learn the entire mapping from scratch with ~80 dots.
 
 Unlike calibrate.py you may move your head naturally -- the model handles it.
 Run: python scripts/quick_calibrate.py        (ESC aborts)
+     python scripts/quick_calibrate.py --model models/gaze_cnn.pt   (for the CNN)
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -24,7 +26,7 @@ from doomscroll.capture.webcam import WebcamSource
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.ml.features import FrameFeaturizer
-from doomscroll.ml.model import DEFAULT_CORRECTION_PATH, DEFAULT_MODEL_PATH, TrainedGazeModel, fit_user_correction
+from doomscroll.ml.model import DEFAULT_MODEL_PATH, correction_path_for, fit_user_correction, load_gaze_model
 
 WINDOW_NAME = "doomscroll quick calibration"
 STEPS = (0.1, 0.5, 0.9)
@@ -45,9 +47,14 @@ def show_dot(w: int, h: int, px: tuple[int, int]) -> bool:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH, help=".joblib or .pt (CNN)")
+    args = ap.parse_args()
+
     ensure_dpi_aware()
     w, h = get_screen_size()
-    model = TrainedGazeModel.load(DEFAULT_MODEL_PATH)  # deliberately WITHOUT any old correction
+    model = load_gaze_model(args.model, with_correction=False)  # deliberately WITHOUT any old correction
+    correction_path = correction_path_for(args.model)
     featurizer = FrameFeaturizer()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
@@ -72,9 +79,9 @@ def main() -> None:
                     ok, frame = cam.read()
                     if not ok or time.monotonic() - start < SETTLE_S:
                         continue
-                    feats, _reason = featurizer.process(frame, cam.frame_timestamp_ms())
-                    if feats is not None:
-                        fracs.append(model.predict_frac(feats))
+                    r = featurizer.process_full(frame, cam.frame_timestamp_ms())
+                    if r.features is not None:
+                        fracs.append(model.predict_frac_frame(r.points_px, r.pose, r.gray))
                 if len(fracs) >= MIN_FRAMES_PER_POINT:
                     predicted.append(np.median(fracs, axis=0))  # median: robust to a stray frame
                     truth.append([fx, fy])
@@ -89,8 +96,8 @@ def main() -> None:
     correction, before, after = fit_user_correction(np.array(predicted), np.array(truth), (w, h))
     print(f"mean error: {before:.0f}px without correction, {after:.0f}px with (leave-one-out)")
     if after < before:
-        correction.save(DEFAULT_CORRECTION_PATH)
-        print(f"Saved -> {DEFAULT_CORRECTION_PATH}")
+        correction.save(correction_path)
+        print(f"Saved -> {correction_path}")
     else:
         print("Correction doesn't help for you; not saving (the base model is used as-is).")
 

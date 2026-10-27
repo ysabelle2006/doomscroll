@@ -4,7 +4,10 @@ Evaluation is the part that is easy to get wrong, so read this once:
 consecutive webcam frames are near-duplicates. A random train/test split puts
 neighbours of every test frame in the training set and reports a
 fantastically optimistic error. We therefore always hold out WHOLE groups:
-  - >= 3 sessions: leave-sessions-out (the honest "new session/person" number)
+  - group_by="person": every session of one participant at a time (the honest
+    "works on someone it has never seen" number; needs >= 2 participants)
+  - >= 3 sessions: leave-sessions-out ("works on a new session", but the same
+    people can be in train and test)
   - fewer: contiguous time blocks of BLOCK_S seconds within the sessions
 Error is reported in pixels (fraction error x that session's screen size).
 """
@@ -49,9 +52,11 @@ class Pooled:
     screen_wh: np.ndarray  # (N, 2) per-sample screen size, for px errors
     groups: np.ndarray
     cv_kind: str
+    participant: np.ndarray | None = None  # (N,) who each row belongs to, for the per-person report
 
 
-def pool(sessions: list[LabeledFrames]) -> Pooled:
+def pool(sessions: list[LabeledFrames], group_by: str = "session") -> Pooled:
+    """group_by: "session" (default; leave-sessions-out or time blocks) or "person"."""
     if not sessions:
         raise ValueError("No datasets found. Run scripts/build_dataset.py first.")
     sessions = [s for s in sessions if len(s.X) > 0]
@@ -60,13 +65,22 @@ def pool(sessions: list[LabeledFrames]) -> Pooled:
     X = np.vstack([s.X for s in sessions])
     y = np.vstack([s.y_frac for s in sessions])
     wh = np.vstack([np.tile(s.screen_wh, (len(s.X), 1)) for s in sessions]).astype(np.float64)
+    who = np.concatenate([[s.participant or s.session_id] * len(s.X) for s in sessions])
+    if group_by == "person":
+        people = sorted(set(who))
+        if len(people) < 2:
+            raise ValueError(f"--cv person needs at least 2 participants; found {people}. "
+                             "Check the 'participant' field in each session's meta.json.")
+        return Pooled(X, y, wh, who, f"leave-person-out ({len(people)} people: {', '.join(people)})", who)
+    if group_by != "session":
+        raise ValueError(f"group_by must be 'session' or 'person', not {group_by!r}")
     if len(sessions) >= MIN_SESSIONS_FOR_SESSION_CV:
         groups = np.concatenate([[s.session_id] * len(s.X) for s in sessions])
         kind = "leave-sessions-out"
     else:
         groups = np.concatenate([[f"{s.session_id}#{int(t // (BLOCK_S * 1000))}" for t in s.t_ms] for s in sessions])
         kind = f"{BLOCK_S:.0f}s time blocks (only {len(sessions)} session(s); collect more for a stricter test)"
-    return Pooled(X, y, wh, groups, kind)
+    return Pooled(X, y, wh, groups, kind, who)
 
 
 def pixel_errors(pred_frac: np.ndarray, true_frac: np.ndarray, screen_wh: np.ndarray) -> np.ndarray:
@@ -95,8 +109,13 @@ def error_by_yaw(errors: np.ndarray, yaw_deg: np.ndarray) -> list[tuple[str, int
     return rows
 
 
+def error_by_group(errors: np.ndarray, labels: np.ndarray) -> list[tuple[str, int, float]]:
+    """Mean px error per label (e.g. per participant)."""
+    return [(str(g), int((labels == g).sum()), float(errors[labels == g].mean())) for g in sorted(set(labels))]
+
+
 def evaluate_candidates(data: Pooled, names: list[str] | None = None) -> dict[str, dict]:
-    """-> {name: {"mean_px", "median_px", "p90_px", "by_yaw"}} from out-of-fold predictions."""
+    """-> {name: {"mean_px", "median_px", "p90_px", "by_yaw", "by_person"}} from out-of-fold predictions."""
     report = {}
     for name in names or list(CANDIDATES):
         pred = out_of_fold_predictions(CANDIDATES[name], data)
@@ -105,6 +124,7 @@ def evaluate_candidates(data: Pooled, names: list[str] | None = None) -> dict[st
             "mean_px": float(err.mean()), "median_px": float(np.median(err)),
             "p90_px": float(np.percentile(err, 90)),
             "by_yaw": error_by_yaw(err, data.X[:, YAW_INDEX]),
+            "by_person": error_by_group(err, data.participant) if data.participant is not None else [],
         }
     return report
 

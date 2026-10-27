@@ -4,8 +4,7 @@ A session is a folder:
 
     <recordings>/<session_id>/
         webcam.mp4         face video (frame i  <->  row i of frames.csv)
-        frames.csv         one row per webcam frame: timestamp, cursor position,
-                           mouse-button state, active flag (0 = paused by hotkey)
+        frames.csv         one row per webcam frame: timestamp + cursor position
         meta.json          who/what/where (screen size, camera, measured fps, ...)
         screen.mp4         OPTIONAL screen recording
         screen_frames.csv  OPTIONAL timestamps for screen.mp4 (same clock as frames.csv)
@@ -16,11 +15,11 @@ start), which is what makes the recordings line up -- see recorder.py.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # v2 added mouse_down + active columns; v1 sessions still load (see dataset.read_frame_log)
-FRAME_LOG_COLUMNS = ("frame_idx", "t_ms", "cursor_x", "cursor_y", "mouse_down", "active")
+SCHEMA_VERSION = 1
+FRAME_LOG_COLUMNS = ("frame_idx", "t_ms", "cursor_x", "cursor_y")
 SCREEN_LOG_COLUMNS = ("frame_idx", "t_ms")
 
 
@@ -39,7 +38,6 @@ class SessionMeta:
     started_at: str = ""  # wall-clock ISO time, for humans only
     has_screen_video: bool = False
     notes: str = ""  # free text: lighting, glasses, "head turned left", ...
-    activity: str = "free"  # what the participant was doing: "free", "game:<name>", ...
     schema_version: int = SCHEMA_VERSION
     extra: dict = field(default_factory=dict)
 
@@ -61,7 +59,12 @@ class SessionPaths:
 
     def read_meta(self) -> SessionMeta:
         raw = json.loads(self.meta_json.read_text())
-        return SessionMeta(**raw)
+        # Fields this version doesn't know (e.g. "activity" from a newer recorder)
+        # are kept in `extra` instead of crashing.
+        known = {f.name for f in fields(SessionMeta)}
+        extra = dict(raw.pop("extra", None) or {})
+        extra.update({k: raw.pop(k) for k in list(raw) if k not in known})
+        return SessionMeta(**raw, extra=extra)
 
 
 def find_sessions(recordings_dir: Path | str) -> list[SessionPaths]:

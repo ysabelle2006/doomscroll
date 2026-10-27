@@ -3,10 +3,12 @@
     python scripts/train_model.py                    # compare candidates, save the best
     python scripts/train_model.py --sweep-lag        # also find the best cursor-lag
     python scripts/train_model.py --model mlp        # force a model
+    python scripts/train_model.py --cv person        # hold out whole PEOPLE (works on someone new?)
 
 Prints, for every candidate, mean/median/p90 pixel error on HELD-OUT data
-(whole sessions or time blocks, never random frames) and the error per
-head-yaw range -- the number that shows whether head angle still hurts.
+(whole sessions, whole people with --cv person, or time blocks; never random
+frames), the error per head-yaw range -- the number that shows whether head
+angle still hurts -- and the error per participant.
 """
 from __future__ import annotations
 
@@ -18,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.ml.dataset import load_all
 from doomscroll.ml.features import FEATURE_NAMES
-from doomscroll.ml.labels import LABEL_MODES, LabelSettings, format_coverage, screen_coverage
 from doomscroll.ml.model import DEFAULT_MODEL_PATH, TrainedGazeModel
 from doomscroll.ml.training import CANDIDATES, evaluate_candidates, fit_final, pool
 
@@ -34,6 +35,11 @@ def print_report(report: dict) -> None:
         print(f"\n{name}: error by head yaw")
         for label, n, err in r["by_yaw"]:
             print(f"  {label:18s} n={n:6d}  mean={err:6.0f}px")
+    for name, r in report.items():
+        if r.get("by_person"):
+            print(f"\n{name}: error by participant")
+            for label, n, err in r["by_person"]:
+                print(f"  {label:18s} n={n:6d}  mean={err:6.0f}px")
 
 
 def main() -> None:
@@ -45,21 +51,15 @@ def main() -> None:
     ap.add_argument("--sweep-lag", action="store_true", help="try several lags with the ridge model and pick the best")
     ap.add_argument("--window-ms", type=float, default=600.0)
     ap.add_argument("--min-travel-px", type=float, default=40.0)
-    ap.add_argument("--max-speed", type=float, default=3000.0,
-                    help="drop frames where the cursor moves faster than this px/s (flicks; eyes can't follow)")
-    ap.add_argument("--label-mode", choices=LABEL_MODES, default="moving",
-                    help="moving = cursor recently moving; clicks = only near mouse-button presses "
-                         "(strongest 'eyes are here' signal for games); either = both")
+    ap.add_argument("--cv", choices=["session", "person"], default="session",
+                    help="hold out whole sessions (default) or whole participants")
     args = ap.parse_args()
 
     sessions = load_all(args.datasets)
     print(f"{len(sessions)} session(s): {', '.join(s.session_id for s in sessions)}")
 
-    def settings(lag):
-        return LabelSettings(lag, args.window_ms, args.min_travel_px, args.max_speed, args.label_mode)
-
     def labeled(lag):
-        return pool([s.labeled(settings(lag)) for s in sessions])
+        return pool([s.labeled(lag, args.window_ms, args.min_travel_px) for s in sessions], group_by=args.cv)
 
     lag = args.lag_ms
     if args.sweep_lag:
@@ -71,10 +71,7 @@ def main() -> None:
         print(f"best lag: {lag} ms")
 
     data = labeled(lag)
-    print(f"{len(data.X)} labeled frames; cross-validation: {data.cv_kind}")
-    print("Where the labels are on screen (rows = top..bottom, cols = left..right; "
-          "empty cells = regions the model never saw):")
-    print(format_coverage(screen_coverage(data.y)) + "\n")
+    print(f"{len(data.X)} labeled frames; cross-validation: {data.cv_kind}\n")
     report = evaluate_candidates(data, [args.model] if args.model else None)
     print_report(report)
 
@@ -83,7 +80,7 @@ def main() -> None:
     model = TrainedGazeModel(
         fit_final(best, data),
         metadata={"kind": best, "lag_ms": lag, "n_frames": int(len(data.X)), "features": list(FEATURE_NAMES),
-                  "sessions": [s.session_id for s in sessions], "label_settings": vars(settings(lag)), "cv": data.cv_kind, "heldout_report": report[best]},
+                  "sessions": [s.session_id for s in sessions], "cv": data.cv_kind, "heldout_report": report[best]},
     )
     model.save(args.out)
 

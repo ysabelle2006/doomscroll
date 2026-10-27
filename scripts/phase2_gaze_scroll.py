@@ -1,14 +1,28 @@
-"""Phase 2: end-to-end naive trigger -- calibrated gaze mapping + attention
-gate + a trivial rule ("dwell in the bottom 15% of the focused window for
-1s -> scroll down"). No content-awareness or pattern-based sensitivity yet
-(that's Phase 3/4); this validates calibration quality and loop timing.
+"""Phase 2: gaze mapping + attention gate + content-aware scroll trigger
+(fixation/scroll_trigger.py, from feat-002):
+
+  1. Gaze in the bottom part of the focused window (BOTTOM_DWELL_FRACTION)
+     for DWELL_MS -> scroll.
+  2. Else, if OCR shows gaze has read the last visible line of text and moved
+     past it, for DWELL_MS -> scroll.
+  3. Else, if no unread text is left between gaze and the bottom of the
+     window, for CONTENT_DWELL_MS -> scroll.
+
+OCR (content/ package, Apple Vision) re-scans the focused window every ~0.4 s
+on a background thread. A transparent click-through overlay (debug/screen_overlay.py)
+is drawn over the window you're reading: green box = line already read, red = not
+read yet, blue = last line on screen, yellow line = "end of content" threshold,
+magenta dot = where you're looking. If OCR or the overlay aren't available
+(pyobjc-framework-Vision not installed, not macOS) it falls back to rule 1 only.
 
 Run scripts/calibrate.py first. Then:
   .venv\\Scripts\\python.exe scripts\\phase2_gaze_scroll.py
 Or, to use the model trained on recorded data (scripts/train_model.py) instead
 of the per-user calibration:
   python scripts/phase2_gaze_scroll.py --model            # models/gaze_model.joblib
+  python scripts/phase2_gaze_scroll.py --model models/gaze_cnn.pt   # the CNN (train_cnn.py)
   python scripts/quick_calibrate.py                       # optional ~15 s per-user nudge
+  python scripts/phase2_gaze_scroll.py --model models/gaze_cnn_v2.pt --content-only  # test rules 2+3 alone
 Press 'q' to quit.
 """
 from __future__ import annotations
@@ -23,25 +37,30 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.capture.webcam import WebcamSource
+from doomscroll.content import get_content_scanner
+from doomscroll.content.gaze_content import BackgroundContentScanner, ContentGazeTracker
 from doomscroll.debug.overlay import draw_gaze_minimap, draw_iris_points, draw_status_lines
+from doomscroll.debug.screen_overlay import ScreenOverlay
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.fixation.attention_gate import AttentionGate
 from doomscroll.fixation.mapper import to_window_relative_fraction
+from doomscroll.fixation.scroll_trigger import ScrollTrigger, ScrollTriggerConfig
 from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
 from doomscroll.gaze.gaze_vector import compute_gaze_feature, is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.gaze.smoothing import GazePointSmoother
-from doomscroll.ml.features import extract_features
-from doomscroll.ml.model import DEFAULT_CORRECTION_PATH, DEFAULT_MODEL_PATH, TrainedGazeModel
+from doomscroll.ml.model import DEFAULT_MODEL_PATH, load_gaze_model
 from doomscroll.landmarks.mediapipe_backend import LEFT_IRIS, RIGHT_IRIS, MediaPipeLandmarkBackend
 from doomscroll.scroll import ScrollUnit, get_scroll_injector
 from doomscroll.windowing import get_window_bounds_provider
 
-BOTTOM_DWELL_FRACTION = 0.85
-DWELL_MS = 1000
+# Scroll-trigger settings (passed into ScrollTriggerConfig below)
+BOTTOM_DWELL_FRACTION = 0.80   # rule 1: bottom 20% of the focused window
+DWELL_MS = 700                 # rules 1+2: how long before scrolling (feat-002's default is 150)
+CONTENT_DWELL_MS = 1000        # rule 3: "nothing unread below gaze" -- broadest rule, so slower
 SCROLL_COOLDOWN_MS = 800
-SCROLL_STEP_LINES = 3
-DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"
+SCROLL_STEP_LINES = 6
+DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"  # just a label; windowing/macos_backend.py ignores our own windows
 
 # A degree-2 polynomial calibration model has no bound on its output for
 # inputs that drift outside the range seen during calibration. Unlike a
@@ -58,10 +77,11 @@ def make_predictor(use_trained_model: bool, model_path: Path, screen_wh: tuple[i
     """-> fn(points_px, head_pose, frame_gray) -> raw screen point (px).
     One seam for both gaze models, so the main loop doesn't care which is used."""
     if use_trained_model:
-        model = TrainedGazeModel.load(model_path, correction_path=DEFAULT_CORRECTION_PATH)
+        model = load_gaze_model(model_path)  # .joblib (landmark model) or .pt (CNN)
         print(f"Using trained model {model.metadata.get('kind')!r}"
               f"{' + per-user correction' if model.correction else ''}")
-        return lambda points_px, pose, gray: model.predict_px(extract_features(points_px, pose, gray), screen_wh)
+        wh = np.array(screen_wh, dtype=np.float64)
+        return lambda points_px, pose, gray: model.predict_frac_frame(points_px, pose, gray) * wh
 
     calibrator = GazeCalibrator.load()
 
@@ -75,8 +95,10 @@ def make_predictor(use_trained_model: bool, model_path: Path, screen_wh: tuple[i
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", nargs="?", const=str(DEFAULT_MODEL_PATH), default=None, metavar="PATH",
-                    help="use a model trained by scripts/train_model.py (default path if no value) "
+                    help="use a model trained by scripts/train_model.py or train_cnn.py (.pt) (default path if no value) "
                          "instead of the calibrate.py profile")
+    ap.add_argument("--content-only", action="store_true",
+                    help="test flag: turn off rule 1 (bottom zone) so only the OCR rules can scroll")
     args = ap.parse_args()
 
     ensure_dpi_aware()
@@ -97,9 +119,41 @@ def main() -> None:
     window_provider = get_window_bounds_provider()
     injector = get_scroll_injector()
 
-    dwell_start_ms: int | None = None
-    cooldown_until_ms = 0
     last_external_bounds = None
+
+    # --- content-aware parts (OCR + overlay + 3-rule trigger) ---------------
+    # The background OCR thread asks for the bounds repeatedly, so give it a
+    # function (reads the latest value) rather than the value itself.
+    def _current_bounds():
+        return last_external_bounds
+
+    try:
+        content_scanner = get_content_scanner()
+        content_available = True
+    except Exception as e:
+        print(f"Content-aware scrolling unavailable ({e}) -- bottom-of-window rule only.")
+        content_scanner, content_available = None, False
+    bg_scanner = BackgroundContentScanner(content_scanner, get_bounds=_current_bounds) if content_scanner else None
+    content_tracker = ContentGazeTracker()
+
+    try:
+        screen_overlay = ScreenOverlay()
+    except Exception as e:
+        print(f"Live content overlay unavailable ({e}) -- continuing without it.")
+        screen_overlay = None
+    overlay_broken = False  # set once if the overlay fails at runtime, so it errors once, not every frame
+
+    trigger = ScrollTrigger(content_tracker, ScrollTriggerConfig(
+        # inf = rule 1 can never fire (window fractions are clamped to 0..1)
+        bottom_definite_fraction=float("inf") if args.content_only else BOTTOM_DWELL_FRACTION,
+        fast_dwell_ms=DWELL_MS,
+        content_tier_dwell_ms=CONTENT_DWELL_MS,
+        cooldown_ms=SCROLL_COOLDOWN_MS,
+    ))
+    if args.content_only:
+        print("--content-only: bottom-zone rule off; only OCR rules can scroll.")
+    if bg_scanner is not None:
+        bg_scanner.start()
 
     with WebcamSource(0) as cam:
         print("Running. Press 'q' to quit.")
@@ -133,9 +187,10 @@ def main() -> None:
             if paused:
                 status_lines.append("PAUSED (looking away)")
                 smoother.reset()
-                dwell_start_ms = None
+                trigger.reset_dwell()
             elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px):
                 status_lines.append("blink...")
+                trigger.reset_dwell()
             elif points_px is not None and head_pose is not None:
                 frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 raw_point = predict_gaze(points_px, head_pose, frame_gray)
@@ -146,56 +201,74 @@ def main() -> None:
                     status_lines.append(f"!! prediction clamped from raw=({raw_point[0]:.0f},{raw_point[1]:.0f})")
                 smoothed_point = smoother.update(clamped_point, timestamp_ms)
 
+                # Track which OCR'd lines the gaze has dwelled on ("seen"), every tick.
+                blocks = bg_scanner.latest_blocks() if bg_scanner is not None else []
+                content_tracker.update(blocks, smoothed_point, timestamp_ms)
+
+                # get_focused_window_bounds() returns None while THIS process
+                # (e.g. the preview window) is frontmost -- see
+                # windowing/macos_backend.py -- so keep the last external window.
                 current_bounds = window_provider.get_focused_window_bounds()
-                # Our own debug preview window can itself become the OS
-                # foreground window (e.g. after a click), which would
-                # otherwise hijack the "focused window" the scroll logic is
-                # supposed to be reasoning about. Ignore self-focus and keep
-                # using the last externally-focused window's bounds instead.
-                if current_bounds is not None and current_bounds.app_name != DEBUG_WINDOW_TITLE:
+                if current_bounds is not None:
                     last_external_bounds = current_bounds
                 bounds = last_external_bounds
 
+                if screen_overlay is not None and not overlay_broken and bounds is not None \
+                        and bounds.width > 0 and bounds.height > 0:
+                    try:
+                        screen_overlay.update(blocks, bounds, smoothed_point,
+                                              content_tracker.seen_ids, content_tracker.end_margin_px)
+                    except Exception as e:
+                        print(f"Live content overlay broke ({e}) -- disabling it for the rest of this run.")
+                        overlay_broken = True
+
                 status_lines.append(f"raw=({raw_point[0]:.0f},{raw_point[1]:.0f}) smoothed=({smoothed_point[0]:.0f},{smoothed_point[1]:.0f})")
+                status_lines.append(f"content: {'on' if content_available else 'off'} "
+                                    f"lines={len(blocks)} seen={len(content_tracker.seen_ids)}")
                 if bounds is None or bounds.width <= 0 or bounds.height <= 0:
                     status_lines.append("no usable focused window bounds")
-                    dwell_start_ms = None
+                    trigger.reset_dwell()
                 else:
                     status_lines.append(
                         f"bounds=({bounds.x},{bounds.y},{bounds.width}x{bounds.height}) app={bounds.app_name!r}"
                     )
                     fx, fy = to_window_relative_fraction(smoothed_point, bounds)
                     status_lines.append(f"gaze frac=({fx:.2f},{fy:.2f})")
-                    draw_gaze_minimap(frame, fx, fy, dwelling=(fy >= BOTTOM_DWELL_FRACTION))
 
-                    if timestamp_ms < cooldown_until_ms:
-                        status_lines.append("cooldown...")
-                        dwell_start_ms = None
-                    elif fy >= BOTTOM_DWELL_FRACTION:
-                        if dwell_start_ms is None:
-                            dwell_start_ms = timestamp_ms
-                        elapsed = timestamp_ms - dwell_start_ms
-                        status_lines.append(f"DWELLING {elapsed}ms / {DWELL_MS}ms")
-                        if elapsed >= DWELL_MS:
-                            target_point = (
-                                bounds.x + bounds.width // 2,
-                                bounds.y + bounds.height // 2,
-                            )
-                            injector.scroll(0, SCROLL_STEP_LINES, ScrollUnit.LINE, target_point=target_point)
-                            print(f"[{timestamp_ms}] SCROLL triggered")
-                            dwell_start_ms = None
-                            cooldown_until_ms = timestamp_ms + SCROLL_COOLDOWN_MS
-                    else:
-                        dwell_start_ms = None
+                    # OCR rules only when OCR has actually found text: with zero lines,
+                    # "nothing unread below gaze" is trivially true and would scroll
+                    # nonstop (startup, blank pages, videos, OCR failures).
+                    should_fire, label = trigger.update(
+                        fy, blocks, smoothed_point, bounds.y + bounds.height, timestamp_ms,
+                        content_available and len(blocks) > 0,
+                    )
+                    status_lines.append(label)
+                    draw_gaze_minimap(frame, fx, fy, dwelling=not label.startswith(("not scrolling", "cooldown")))
+
+                    if should_fire:
+                        target_point = (
+                            bounds.x + bounds.width // 2,
+                            bounds.y + bounds.height // 2,
+                        )
+                        injector.scroll(0, SCROLL_STEP_LINES, ScrollUnit.LINE, target_point=target_point)
+                        trigger.note_scroll_fired(timestamp_ms)
+                        print(f"[{timestamp_ms}] SCROLL triggered ({label})")
             else:
                 status_lines.append("no face detected")
-                dwell_start_ms = None
+                trigger.reset_dwell()
 
             draw_status_lines(frame, status_lines)
-            cv2.imshow("doomscroll - Phase 2", frame)
+            cv2.imshow(DEBUG_WINDOW_TITLE, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
+    if bg_scanner is not None:
+        bg_scanner.stop()
+    if screen_overlay is not None:
+        try:
+            screen_overlay.close()
+        except Exception:
+            pass
     backend.close()
     cv2.destroyAllWindows()
 

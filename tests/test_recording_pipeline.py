@@ -7,10 +7,7 @@ import pytest
 
 from doomscroll.ml.dataset import SessionDataset, build_session_dataset, read_frame_log
 from doomscroll.ml.features import FEATURE_DIM, FEATURE_NAMES, YAW_INDEX
-from doomscroll.ml.labels import (
-    LabelSettings, activity_mask, click_times, cursor_at, cursor_quality_warnings, make_labels, near_click_mask,
-    screen_coverage, speed_mask,
-)
+from doomscroll.ml.labels import activity_mask, cursor_at, make_labels
 from doomscroll.ml.model import AffineCorrection, TrainedGazeModel
 from doomscroll.ml.training import CANDIDATES, evaluate_candidates, fit_final, pool
 from doomscroll.recording.recorder import Recorder
@@ -53,9 +50,6 @@ class SweepingCursor:
     def position(self):
         return (self.clock.t % 1.0) * SCREEN[0], 300.0
 
-    def button_down(self):
-        return (self.clock.t % 1.0) < 0.1  # one short "click" per sweep
-
 
 def record(tmp_path, duration=4.0, fail_every=0):
     clock = FakeClock()
@@ -69,8 +63,7 @@ def test_every_video_frame_has_exactly_one_log_row(tmp_path):
     import cv2
 
     paths, meta = record(tmp_path, fail_every=7)  # failed reads must not desync video and log
-    t, xy, down, active = read_frame_log(paths.frames_csv)
-    assert down.any() and active.all()
+    t, xy = read_frame_log(paths.frames_csv)
     cap = cv2.VideoCapture(str(paths.webcam_video))
     n_video = 0
     while cap.read()[0]:
@@ -109,9 +102,9 @@ def test_labels_lag_and_idle_filter():
     assert not activity_mask(t, still).any()
     moving = np.column_stack([np.linspace(0, 1000, len(t)), np.full(len(t), 300.0)])
     assert activity_mask(t, moving).all()
-    y, keep = make_labels(t, moving, SCREEN, LabelSettings(lag_ms=0))
+    y, keep = make_labels(t, moving, SCREEN, lag_ms=0)
     assert y[0, 0] == pytest.approx(0.0) and keep.all()
-    y_lag, _ = make_labels(t, moving, SCREEN, LabelSettings(lag_ms=300))
+    y_lag, _ = make_labels(t, moving, SCREEN, lag_ms=300)
     assert y_lag[10, 0] > y[10, 0]  # label taken from the cursor's FUTURE position
     np.testing.assert_allclose(cursor_at(np.array([50.0]), np.array([0.0, 100.0]), np.array([[0, 0], [10, 20.0]])), [[5, 10]])
 
@@ -236,80 +229,27 @@ def test_fit_user_correction_reports_loo():
     assert after < before / 3
 
 
-# ---- game-play recording: pause, clicks, fast flicks, locked cursor ----
+def test_leave_person_out_never_tests_on_a_training_person():
+    from dataclasses import replace
 
-T = np.arange(0, 6000, 33.3)
+    from sklearn.model_selection import GroupKFold
 
-
-def test_pause_flag_is_recorded_and_excluded(tmp_path):
-    clock = FakeClock()
-    paths = SessionPaths(tmp_path / "g1")
-    cam = FakeCamera(clock)
-    rec = Recorder(cam, SweepingCursor(clock), paths, SessionMeta("g1", "t", *SCREEN), clock=clock,
-                   is_paused=lambda: 1.0 <= clock.t < 2.0)
-    rec.run(4.0)
-    t, xy, down, active = read_frame_log(paths.frames_csv)
-    assert 0.2 < (1 - active.mean()) < 0.3  # ~1 s of 4 s paused, rows still written
-    ds = build_session_dataset(paths.dir, fake_featurize_factory())
-    labeled = ds.labeled()
-    assert not np.isin(labeled.t_ms, t[active == 0]).any()
-
-
-def test_speed_filter_drops_flicks_but_keeps_tracking():
-    slow = np.column_stack([np.linspace(0, 500, len(T)), np.full(len(T), 300.0)])  # ~83 px/s
-    fast = np.column_stack([np.linspace(0, 100000, len(T)), np.full(len(T), 300.0)])  # ~16000 px/s
-    assert speed_mask(T, slow, 600, 3000).all()
-    assert not speed_mask(T, fast, 600, 3000).any()
+    sessions = synthetic_sessions(n_sessions=6, n=200)
+    people = ["anni", "anni", "bo", "bo", "cy", "cy"]
+    sessions = [replace(s, participant=p) for s, p in zip(sessions, people)]
+    data = pool(sessions, group_by="person")
+    assert data.cv_kind.startswith("leave-person-out (3 people")
+    for train, test in GroupKFold(n_splits=3).split(data.X, data.y, data.groups):
+        assert not set(data.participant[train]) & set(data.participant[test])
+    report = evaluate_candidates(data, ["ridge"])
+    assert [p for p, _, _ in report["ridge"]["by_person"]] == ["anni", "bo", "cy"]
+    # default is unchanged: sessions are the groups
+    assert pool(sessions).cv_kind == "leave-sessions-out"
 
 
-def test_click_edges_and_window():
-    pressed = np.zeros(len(T), dtype=int)
-    pressed[100:110] = 1  # one held press: counts once
-    clicks = click_times(T, pressed)
-    assert len(clicks) == 1 and clicks[0] == pytest.approx(T[100])
-    near = near_click_mask(T, pressed, before_ms=500, after_ms=100)
-    assert near[100] and near[90] and not near[50]  # before the press yes, long before no
-    assert not near[130]  # well after
+def test_leave_person_out_needs_two_people():
+    from dataclasses import replace
 
-
-def test_label_modes():
-    still = np.tile([500.0, 300.0], (len(T), 1))
-    pressed = np.zeros(len(T), dtype=int)
-    pressed[100] = 1
-    _, keep_moving = make_labels(T, still, SCREEN, LabelSettings(mode="moving"), pressed=pressed)
-    _, keep_clicks = make_labels(T, still, SCREEN, LabelSettings(mode="clicks"), pressed=pressed)
-    _, keep_either = make_labels(T, still, SCREEN, LabelSettings(mode="either"), pressed=pressed)
-    assert not keep_moving.any()  # parked cursor: not usable by itself
-    assert keep_clicks.any() and keep_clicks.sum() < len(T) / 4  # only around the click
-    assert keep_either.sum() == keep_clicks.sum()
-    _, keep_no_clicks_logged = make_labels(T, still, SCREEN, LabelSettings(mode="clicks"))
-    assert not keep_no_clicks_logged.any()
-    with pytest.raises(ValueError):
-        LabelSettings(mode="nonsense")
-
-
-def test_inactive_frames_dropped():
-    moving = np.column_stack([np.linspace(0, 1000, len(T)), np.full(len(T), 300.0)])
-    active = np.ones(len(T), dtype=int)
-    active[50:80] = 0
-    _, keep = make_labels(T, moving, SCREEN, active=active)
-    assert keep[40] and not keep[60:75].any()
-
-
-def test_locked_cursor_is_flagged():
-    locked = np.tile([500.0, 300.0], (len(T), 1))  # FPS game pinned the cursor to one point
-    assert any("ONE position" in w for w in cursor_quality_warnings(T, locked, SCREEN))
-    roaming = np.column_stack([np.linspace(0, 1000, len(T)), 300 + 100 * np.sin(T / 300)])
-    assert cursor_quality_warnings(T, roaming, SCREEN) == []
-
-
-def test_screen_coverage_shows_gaps():
-    left_only = np.column_stack([np.random.default_rng(0).uniform(0, 0.4, 500), np.random.default_rng(1).uniform(0, 1, 500)])
-    counts = screen_coverage(left_only, grid=5)
-    assert counts.sum() == 500 and (counts[:, 3:] == 0).all() and (counts[:, :2] > 0).all()
-
-
-def test_old_v1_frame_log_still_loads(tmp_path):
-    (tmp_path / "frames.csv").write_text("frame_idx,t_ms,cursor_x,cursor_y\n0,0.0,10,20\n1,33.0,11,21\n")
-    t, xy, down, active = read_frame_log(tmp_path / "frames.csv")
-    assert len(t) == 2 and not down.any() and active.all()
+    sessions = [replace(s, participant="anni") for s in synthetic_sessions(n_sessions=3, n=100)]
+    with pytest.raises(ValueError, match="at least 2 participants"):
+        pool(sessions, group_by="person")

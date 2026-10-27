@@ -38,34 +38,6 @@ afterwards. Consequences:
 > those can't be synced as reliably. Re-record with `record_session.py`, or write a
 > converter that produces the same `frames.csv` format (see `recording/session.py`).
 
-## Collecting data by playing games
-
-Games give varied, unscripted eye and cursor movement, but only if the cursor
-is a real pointer. Choose accordingly:
-
-| Good | Bad |
-|---|---|
-| Mouse-driven games: strategy/RTS, city builders, card games, osu!/aim trainers, puzzle, browser games, map-based games | Mouse-look games (FPS / third-person): the game locks the cursor to the centre, so cursor position says nothing about gaze |
-| Windowed or borderless window, on the monitor the camera is on | Exclusive fullscreen (cursor/coordinates can differ), gamepad games (no cursor) |
-
-```bash
-python scripts/record_session.py --participant nicole --activity game:osu --duration 900 --notes "head forward"
-```
-- **F8** stops, **F9** pauses/resumes. These are global, so they work while the game has focus.
-  Pause for menus, loading screens and chat. Paused frames are kept in the files (so video and CSV
-  stay in step) but flagged `active=0` and never trained on.
-- The recorder logs mouse-button state. People look at what they click, so
-  `train_model.py --label-mode clicks` (only frames just before a click) is the cleanest,
-  smallest label set; `either` combines it with "cursor recently moving". Compare them by
-  held-out error rather than assuming.
-- `--max-speed` (default 3000 px/s) drops flick moves the eyes can't follow.
-- After each recording a warning appears if the cursor sat on one point for >50% of the
-  session (the game captured the mouse). Discard such sessions.
-- `train_model.py` prints a screen-coverage grid. Empty cells mean the model never saw
-  those regions; play something that uses the whole screen, or add a session that does.
-- Games bias gaze toward the centre and toward targets, so keep a few minutes of
-  free cursor sweeping to the edges/corners in the mix, since the scroll trigger works at the bottom edge.
-
 ## Collecting good data (most important part)
 
 The label is "where the cursor is", which equals "where the eyes are" ONLY if
@@ -115,9 +87,39 @@ Run the app with `phase2_gaze_scroll.py --model`.
 - New model type: add one line to `CANDIDATES`.
 - Tests: `pytest tests` (no camera/MediaPipe needed; uses fakes).
 
+## CNN on eye crops (appearance-based model)
+
+Instead of hand-made landmark numbers, a small CNN looks at the eye pixels.
+
+```bash
+pip install torch                                  # or: uv pip install -e ".[macos,cnn]"
+python scripts/build_crops.py --preview            # MediaPipe once -> data/crops/*.npz (+ crop contact sheets)
+python scripts/train_cnn.py                        # held-out test vs ridge/hgb on the same frames, then save
+python scripts/quick_calibrate.py --model models/gaze_cnn.pt      # optional 15 s nudge
+python scripts/phase2_gaze_scroll.py --model models/gaze_cnn.pt
+```
+
+| Piece | Code | Notes |
+|---|---|---|
+| What pixels the CNN sees | `ml/eye_crops.py` | Each eye cut along its corner line (roll removed), sized by eye width, 36x60, hist-equalized; 64x64 face. Used offline AND live. |
+| Crop dataset | `ml/crop_dataset.py` | Like `dataset.py`; crops stored for usable frames only; labels made at train time. |
+| Model + training | `ml/cnn.py` | Shared eye tower x2 + face tower + the 11 landmark features -> FC -> (x, y) screen fraction. Huber loss in pixels. |
+| Live | `CnnGazeModel` via `ml.model.load_gaze_model` | `.pt` -> CNN, `.joblib` -> sklearn; same `predict_frac_frame(points, pose, gray)`. CPU, ~ms per frame. |
+
+Honest evaluation is the same as before: whole sessions held out (>= 3 sessions),
+early stopping on the last 10% of each *training* session, and ridge/hgb are
+re-run on exactly the same frames and folds so the table is apples to apples.
+`--no-aux` trains a pixels-only network: the gap between it and the default
+shows how much the images add on top of the landmark features.
+
+Data reality check: a CNN is data-hungry. With one person it will learn *that
+person*; expect it to beat ridge/hgb on held-out sessions of the same person
+first, and only generalise to new people after several people are recorded.
+More sessions (different lighting, head poses, days) help more than more epochs.
+Look at the `--preview` contact sheet before training: if eyes aren't centred
+in the crops, nothing downstream will work.
+
 ## Not done / next steps
 
-- A CNN on eye crops (true appearance-based model) usually beats landmark features
-  but needs far more data (tens of thousands of frames, many people). Add
-  eye-crop saving in `build_dataset` and a torch model in `ml/` if the data allows.
+- Temporal model (a few frames stacked) and per-user fine-tuning of the CNN's last layer.
 - The old `calibrate.py` and the non-`--model` path in `phase2_gaze_scroll.py` are untouched.

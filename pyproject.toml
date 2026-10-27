@@ -14,11 +14,13 @@ dependencies = [
     "pydantic>=2",
     "platformdirs",
     "loguru",
+    "pandas>=2.3.3",
 ]
 
 [project.optional-dependencies]
 windows = ["pywin32"]
-macos = ["pyobjc-framework-Quartz", "pyobjc-framework-Cocoa"]
+macos = ["pyobjc-framework-Quartz", "pyobjc-framework-Cocoa", "pyobjc-framework-Vision"]
+cnn = ["torch>=2.2"]  # only for scripts/train_cnn.py and running the CNN model
 
 [tool.setuptools.packages.find]
 where = ["src"]

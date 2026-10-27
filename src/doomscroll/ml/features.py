@@ -14,6 +14,8 @@ adds what the head-angle problem was missing:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from doomscroll.gaze.gaze_vector import (
@@ -60,6 +62,17 @@ def extract_features(
     ).astype(np.float64)
 
 
+@dataclass
+class FrameResult:
+    """Everything known about one frame. features is None unless reason == "ok"."""
+
+    features: np.ndarray | None
+    reason: str  # "ok" | "no_face" | "no_pose" | "blink"
+    points_px: np.ndarray | None = None
+    pose: HeadPose | None = None
+    gray: np.ndarray | None = None
+
+
 class FrameFeaturizer:
     """frame (BGR) -> feature vector, or None plus a reason string.
     Stateful (head-pose solver is seeded by the previous frame), so feed it
@@ -78,20 +91,26 @@ class FrameFeaturizer:
         self._pose.reset()
 
     def process(self, frame_bgr: np.ndarray, timestamp_ms: int) -> tuple[np.ndarray | None, str]:
+        r = self.process_full(frame_bgr, timestamp_ms)
+        return r.features, r.reason
+
+    def process_full(self, frame_bgr: np.ndarray, timestamp_ms: int) -> "FrameResult":
+        """Like process(), but also returns the landmarks, pose and gray frame
+        (the CNN needs the pixels, not just the feature vector)."""
         import cv2
 
         result = self._backend.detect(frame_bgr, timestamp_ms)
         if result is None:
             self._pose.reset()
-            return None, "no_face"
+            return FrameResult(None, "no_face")
         points_px = result.points_px()
         pose = self._pose.estimate(points_px, result.image_width, result.image_height)
         if pose is None:
-            return None, "no_pose"
+            return FrameResult(None, "no_pose", points_px)
         if not is_gaze_usable(points_px):
-            return None, "blink"
+            return FrameResult(None, "blink", points_px, pose)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        return extract_features(points_px, pose, gray), "ok"
+        return FrameResult(extract_features(points_px, pose, gray), "ok", points_px, pose, gray)
 
     def close(self) -> None:
         self._backend.close()

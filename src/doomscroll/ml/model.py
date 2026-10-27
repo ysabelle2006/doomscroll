@@ -73,6 +73,12 @@ class TrainedGazeModel:
     def predict_px(self, feature: np.ndarray, screen_wh: tuple[int, int]) -> np.ndarray:
         return self.predict_frac(feature) * np.array(screen_wh, dtype=np.float64)
 
+    def predict_frac_frame(self, points_px: np.ndarray, pose, gray: np.ndarray | None) -> np.ndarray:
+        """Same call shape as CnnGazeModel, so scripts can use either (see load_gaze_model)."""
+        from doomscroll.ml.features import extract_features
+
+        return self.predict_frac(extract_features(points_px, pose, gray))
+
     def save(self, path: Path | str = DEFAULT_MODEL_PATH) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,3 +113,22 @@ def fit_user_correction(
         c = AffineCorrection.fit(predicted[keep], truth[keep], shrink)
         loo.append(np.linalg.norm((c.apply(predicted[i]) - truth[i]) * wh))
     return AffineCorrection.fit(predicted, truth, shrink), before, float(np.mean(loo))
+
+
+def correction_path_for(model_path: Path | str) -> Path:
+    """Each model gets its own per-user correction (a nudge fitted for one model is wrong for another)."""
+    if Path(model_path).suffix == ".pt":
+        return DEFAULT_CORRECTION_PATH.with_name("affine_correction_cnn.json")
+    return DEFAULT_CORRECTION_PATH
+
+
+def load_gaze_model(path: Path | str, with_correction: bool = True):
+    """.joblib -> TrainedGazeModel (sklearn on landmark features); .pt -> CnnGazeModel (needs torch).
+    Both offer predict_frac_frame(points_px, pose, gray) and .metadata / .correction."""
+    path = Path(path)
+    corr = correction_path_for(path) if with_correction else None
+    if path.suffix == ".pt":
+        from doomscroll.ml.cnn import CnnGazeModel  # torch only needed for the CNN
+
+        return CnnGazeModel.load(path, correction_path=corr)
+    return TrainedGazeModel.load(path, correction_path=corr)

@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from doomscroll.ml.features import FEATURE_NAMES
-from doomscroll.ml.labels import LabelSettings, make_labels
+from doomscroll.ml.labels import make_labels
 from doomscroll.recording.session import SessionPaths
 
 # frame -> (features or None, reason). Matches FrameFeaturizer.process, so
@@ -33,6 +33,7 @@ class LabeledFrames:
     X: np.ndarray  # (N, FEATURE_DIM)
     y_frac: np.ndarray  # (N, 2) cursor / screen size
     t_ms: np.ndarray  # (N,)
+    participant: str = ""  # who was recorded; used for leave-person-out testing
 
 
 @dataclass
@@ -49,15 +50,11 @@ class SessionDataset:
     reasons: np.ndarray  # (N,) "ok" | "no_face" | "no_pose" | "blink"
     cursor_xy: np.ndarray  # (N, 2) px
     t_ms: np.ndarray  # (N,)
-    mouse_down: np.ndarray  # (N,) 0/1
-    active: np.ndarray  # (N,) 0/1; 0 = recorder was paused
 
-    def labeled(self, settings: LabelSettings = LabelSettings()) -> LabeledFrames:
-        y_frac, label_ok = make_labels(
-            self.t_ms, self.cursor_xy, self.screen_wh, settings, pressed=self.mouse_down, active=self.active
-        )
+    def labeled(self, lag_ms: float = 0.0, window_ms: float = 600.0, min_travel_px: float = 40.0) -> LabeledFrames:
+        y_frac, label_ok = make_labels(self.t_ms, self.cursor_xy, self.screen_wh, lag_ms, window_ms, min_travel_px)
         keep = label_ok & (self.reasons == "ok")
-        return LabeledFrames(self.session_id, self.screen_wh, self.X[keep], y_frac[keep], self.t_ms[keep])
+        return LabeledFrames(self.session_id, self.screen_wh, self.X[keep], y_frac[keep], self.t_ms[keep], self.participant)
 
     def summary(self) -> dict:
         return {k: int(v) for k, v in zip(*np.unique(self.reasons, return_counts=True))}
@@ -66,7 +63,6 @@ class SessionDataset:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             path, X=self.X, reasons=self.reasons, cursor_xy=self.cursor_xy, t_ms=self.t_ms,
-            mouse_down=self.mouse_down, active=self.active,
             feature_names=np.array(FEATURE_NAMES),
             info=json.dumps({"session_id": self.session_id, "participant": self.participant,
                              "screen_wh": list(self.screen_wh)}),
@@ -78,24 +74,17 @@ class SessionDataset:
         if tuple(d["feature_names"]) != FEATURE_NAMES:
             raise ValueError(f"{path} was built with different features; rebuild it (scripts/build_dataset.py)")
         info = json.loads(str(d["info"]))
-        n = len(d["t_ms"])
-        # .npz files built before click/pause logging existed: no clicks, always active.
-        mouse_down = d["mouse_down"] if "mouse_down" in d.files else np.zeros(n, dtype=int)
-        active = d["active"] if "active" in d.files else np.ones(n, dtype=int)
         return cls(info["session_id"], info["participant"], tuple(info["screen_wh"]),
-                   d["X"], d["reasons"], d["cursor_xy"], d["t_ms"], mouse_down, active)
+                   d["X"], d["reasons"], d["cursor_xy"], d["t_ms"])
 
 
-def read_frame_log(csv_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """-> (t_ms, cursor_xy (N,2), mouse_down, active); row i belongs to video
-    frame i. Older (v1) logs lack the last two columns: no clicks, always active."""
+def read_frame_log(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """-> (t_ms (N,), cursor_xy (N,2)); row i belongs to video frame i."""
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
     t = np.array([float(r["t_ms"]) for r in rows])
     xy = np.array([[float(r["cursor_x"]), float(r["cursor_y"])] for r in rows])
-    down = np.array([int(r.get("mouse_down", 0)) for r in rows])
-    active = np.array([int(r.get("active", 1)) for r in rows])
-    return t, xy, down, active
+    return t, xy
 
 
 def build_session_dataset(
@@ -105,7 +94,7 @@ def build_session_dataset(
 ) -> SessionDataset:
     paths = SessionPaths(session_dir)
     meta = paths.read_meta()
-    t_ms, cursor_xy, mouse_down, active = read_frame_log(paths.frames_csv)
+    t_ms, cursor_xy = read_frame_log(paths.frames_csv)
 
     cap = cv2.VideoCapture(str(paths.webcam_video))
     if not cap.isOpened():
@@ -127,7 +116,7 @@ def build_session_dataset(
     finally:
         cap.release()
     return SessionDataset(meta.session_id, meta.participant, (meta.screen_w, meta.screen_h),
-                          X, reasons, cursor_xy, t_ms, mouse_down, active)
+                          X, reasons, cursor_xy, t_ms)
 
 
 def load_all(dataset_dir: Path | str) -> list[SessionDataset]:

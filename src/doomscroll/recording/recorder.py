@@ -43,65 +43,20 @@ class FrameSource(Protocol):
 
 class CursorSource(Protocol):
     def position(self) -> tuple[float, float]: ...
-    def button_down(self) -> bool: ...
 
 
 class PynputCursor:
-    """Global mouse position + button state (works while a game has focus).
-    macOS: needs Accessibility / Input Monitoring permission for the terminal/IDE running this.
-
-    A game that captures the mouse (FPS camera control) stops the OS cursor
-    from moving; the position then says nothing about gaze. Prefer windowed /
-    cursor-visible games (see docs/ML_PIPELINE.md); the cursor-quality check
-    after the session warns when this happened."""
+    """Global mouse position (works while another app is focused).
+    macOS: needs Accessibility permission for the terminal/IDE running this."""
 
     def __init__(self):
-        from pynput.mouse import Controller, Listener
+        from pynput.mouse import Controller
 
         self._mouse = Controller()
-        self._down = False
-        self._listener = Listener(on_click=self._on_click)
-        self._listener.start()
-
-    def _on_click(self, _x, _y, _button, pressed: bool) -> None:
-        self._down = pressed  # any button; good enough as a "looking at what I click" signal
 
     def position(self) -> tuple[float, float]:
         x, y = self._mouse.position
         return float(x), float(y)
-
-    def button_down(self) -> bool:
-        return self._down
-
-    def close(self) -> None:
-        self._listener.stop()
-
-
-class HotkeyControls:
-    """Global hotkeys, so you can control a recording while a game has focus.
-
-        F8  stop the recording        F9  pause / resume (menus, loading, chat)
-
-    Paused frames are still written (so video and CSV stay in step) but are
-    flagged active=0 and never used for training."""
-
-    def __init__(self, stop_key: str = "f8", pause_key: str = "f9"):
-        from pynput.keyboard import GlobalHotKeys
-
-        self.stop_requested = False
-        self.paused = False
-        self._listener = GlobalHotKeys({f"<{stop_key}>": self._stop, f"<{pause_key}>": self._toggle_pause})
-        self._listener.start()
-
-    def _stop(self) -> None:
-        self.stop_requested = True
-
-    def _toggle_pause(self) -> None:
-        self.paused = not self.paused
-        print(f"\n  {'PAUSED' if self.paused else 'RESUMED'}")
-
-    def close(self) -> None:
-        self._listener.stop()
 
 
 class Recorder:
@@ -114,7 +69,6 @@ class Recorder:
         record_screen: bool = False,
         clock: Callable[[], float] = time.perf_counter,
         on_frame: Callable[[int, float, np.ndarray], bool] | None = None,
-        is_paused: Callable[[], bool] = lambda: False,
     ):
         """on_frame(idx, t_ms, frame) is called per frame (e.g. for a preview
         window); return True to request stop."""
@@ -123,7 +77,6 @@ class Recorder:
         self._record_screen = record_screen
         self._clock = clock
         self._on_frame = on_frame
-        self._is_paused = is_paused
 
     def run(self, duration_s: float, should_stop: Callable[[], bool] = lambda: False) -> SessionMeta:
         paths, meta = self._paths, self._meta
@@ -147,7 +100,6 @@ class Recorder:
                     ok, frame = self._camera.read()
                     t_ms = (self._clock() - t0) * 1000.0  # stamp as soon as the frame arrives
                     cx, cy = self._cursor.position()
-                    down = self._cursor.button_down()
                     if not ok or frame is None:
                         continue  # a failed read is simply not a frame: no row, no video frame
                     if t_ms > duration_s * 1000.0:
@@ -162,7 +114,7 @@ class Recorder:
                         if not writer.isOpened():
                             raise RuntimeError(f"Could not open video writer for {paths.webcam_video}")
                     writer.write(frame)
-                    log.writerow([n_frames, f"{t_ms:.3f}", f"{cx:.1f}", f"{cy:.1f}", int(down), int(not self._is_paused())])
+                    log.writerow([n_frames, f"{t_ms:.3f}", f"{cx:.1f}", f"{cy:.1f}"])
                     last_t_ms = t_ms
                     n_frames += 1
                     if n_frames % FLUSH_EVERY_N_FRAMES == 0:
