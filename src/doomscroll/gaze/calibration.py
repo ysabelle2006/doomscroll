@@ -1,19 +1,12 @@
 """Screen-space gaze mapping: Ridge regression from
-[eye-in-head vector (4), head rotation (3), head translation (3)] ->
-(screen_x, screen_y).
+[eye-in-head vector (4), head pose (3)] -> (screen_x, screen_y), plus an
+optional local-correction stage on top (see GazeCalibrator docstring).
 
-Including head pose -- both rotation (yaw/pitch/roll) and translation
-(the solvePnP position vector, i.e. where the head sits relative to the
-camera) -- as regressor inputs, rather than geometrically subtracting them
-out, is what lets the model absorb natural head-pose variation captured
-during calibration, so small incidental head motion at runtime doesn't
-require recalibration -- see the project plan's calibration design
-rationale. Translation matters here as much as rotation: the eye-in-head
-offset for a fixed gaze target changes as the head moves nearer/farther or
-side-to-side relative to the screen, and that shift was previously
-invisible to the model entirely (only rotation was fed in). See
-calibrate.py's head-pose variation pass for how meaningful variation in
-both is captured during calibration rather than left at near-zero.
+Including head pose as a regressor input (rather than geometrically
+subtracting it out) is what lets the model absorb natural head-pose
+variation captured during calibration, so small incidental head motion at
+runtime doesn't require recalibration -- see the project plan's calibration
+design rationale.
 """
 from __future__ import annotations
 
@@ -27,15 +20,15 @@ from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
-CALIBRATION_DIR = Path(user_data_dir("gazescroll")) / "calibration"
+CALIBRATION_DIR = Path(user_data_dir("doomscroll")) / "calibration"
 DEFAULT_PROFILE_PATH = CALIBRATION_DIR / "default.joblib"
 
-FEATURE_DIM = 10  # 4 (eye-in-head) + 3 (yaw, pitch, roll) + 3 (head translation x,y,z mm)
+FEATURE_DIM = 7  # 4 (eye-in-head) + 3 (yaw, pitch, roll)
 MIN_CALIBRATION_SAMPLES = 30
 MAX_LEAVE_ONE_GROUP_OUT_GROUPS = 20  # switch to GroupKFold beyond this many points
 
 # Log-spaced search range handed to RidgeCV. Kept much smaller now that the
-# default model is linear (11 params incl. bias, not the 36+-term polynomial
+# default model is linear (8 params incl. bias, not the 36-term polynomial
 # this range was originally sized for): heavy regularization shrinks the
 # fitted mapping's slope/gain, which technically minimizes validation MSE on
 # noisy calibration data but compresses the model's dynamic range in
@@ -55,42 +48,57 @@ LOCAL_CORRECTION_BANDWIDTH = 1.5
 LOCAL_CORRECTION_MAX_WEIGHT = 0.5  # cap on how much of the local residual to trust, even at zero distance
 
 
-def build_feature_vector(
-    gaze_vector: np.ndarray,
-    head_pose_deg: tuple[float, float, float],
-    head_translation_mm: tuple[float, float, float],
-) -> np.ndarray:
-    return np.concatenate(
-        [
-            gaze_vector,
-            np.array(head_pose_deg, dtype=np.float64),
-            np.array(head_translation_mm, dtype=np.float64),
-        ]
-    )
+def build_feature_vector(gaze_vector: np.ndarray, head_pose_deg: tuple[float, float, float]) -> np.ndarray:
+    return np.concatenate([gaze_vector, np.array(head_pose_deg, dtype=np.float64)])
 
 
 class GazeCalibrator:
-    """Degree-1 (linear) by default. Degree-2 polynomial expansion was tried
-    first (it captures the real nonlinearity in eye-rotation-to-screen
-    mapping, and in principle improves accuracy near the edges), but in
-    practice a 36-term quadratic model fit on only ~16 independent
-    calibration points is prone to extrapolating wildly for any live input
-    that isn't close to one of those 16 clusters -- observed as the
-    predicted point pinning to a screen corner on most frames, regardless of
-    regularization strategy (RidgeCV, group-aware CV). A bounded, somewhat
-    less accurate linear fit is the safer choice for this small-sample-per-
-    session regime -- this is also what lightweight webcam gaze trackers
-    like WebGazer.js use for the same reason. Revisit degree=2 if calibration
-    ever collects substantially more independent points, or move to an
-    appearance-based model instead of chasing more polynomial capacity here.
+    """Two stages:
+
+    1. A degree-1 (linear) global RidgeCV model, same as before. Degree-2
+       polynomial expansion was tried first (it captures the real
+       nonlinearity in eye-rotation-to-screen mapping, and in principle
+       improves accuracy near the edges), but in practice a 36-term
+       quadratic model fit on only ~16 independent calibration points was
+       prone to extrapolating wildly for any live input that isn't close to
+       one of those clusters -- observed as the predicted point pinning to
+       a screen corner on most frames, regardless of regularization
+       strategy. A bounded, somewhat less accurate linear fit is the safer
+       global model for this regime -- this is also what lightweight webcam
+       gaze trackers like WebGazer.js use for the same reason.
+
+    2. A local residual-correction stage on top: after fitting the global
+       linear model, this stores each training sample's residual (true
+       target minus the global model's prediction for it) alongside its
+       transformed feature vector. At prediction time, it finds the K
+       nearest calibration samples (in transformed feature space) to the
+       live input, and blends a distance-weighted average of *their*
+       residuals into the global prediction -- weighted down to near-zero
+       for a live input that's far from any calibration sample, so it can
+       only ever nudge the global model's prediction, never override it far
+       from real training data. This is deliberately NOT a global nonlinear
+       model (like the rejected degree-2 polynomial): it can only correct
+       in neighborhoods where enough real calibration data actually exists,
+       which is exactly where nonlinear correction is trustworthy and where
+       a global polynomial's extrapolation risk doesn't apply. Conceptually
+       similar to how some webcam gaze trackers blend a coarse/robust
+       estimate with a more precise local one (e.g. EyeGestures describes a
+       "two-stage" blend of two internal models) -- this local-correction
+       design is our own independent implementation of that general idea,
+       not their code, and the exact mechanism (KNN residual blending vs.
+       whatever they actually do internally) is different.
+
+       Now that calibration collects substantially more independent points
+       than the original single-angle 16-point routine (multiple head-angle
+       blocks; see scripts/calibrate.py), there's enough local density for
+       this to be worthwhile where it wasn't before.
 
     StandardScaler runs first: the raw feature vector mixes a unitless
-    gaze-offset signal (~+-0.1 range) with head-rotation degrees (~+-30-50
-    range) and head-translation millimeters (~hundreds), and Ridge's L2
-    penalty treats coefficient magnitude uniformly -- without scaling, the
-    small-scale (but most informative) gaze signal needs large coefficients
-    and gets disproportionately penalized relative to head pose, which is
-    backwards from what the model should learn.
+    gaze-offset signal (~+-0.1 range) with head-pose degrees (~+-30-50
+    range), and Ridge's L2 penalty treats coefficient magnitude uniformly --
+    without scaling, the small-scale (but most informative) gaze signal
+    needs large coefficients and gets disproportionately penalized relative
+    to head pose, which is backwards from what the model should learn.
 
     Regularization strength is chosen by cross-validation over DEFAULT_ALPHAS
     rather than a hand-picked fixed alpha -- but critically, that CV must be
@@ -99,37 +107,16 @@ class GazeCalibrator:
     captured per calibration point are highly correlated near-duplicates, so
     ordinary LOO leaves near-identical frames from the same point in the
     training fold, making an overfit model look like it generalizes
-    perfectly. That systematically selects too little regularization, and
-    the resulting degree-2 polynomial model then extrapolates wildly (huge
-    x/y values, clamped to a screen corner after fraction-clipping) for any
-    live input that isn't essentially an exact calibration point. Leaving out
-    one whole calibration point per fold forces the model to generalize to
-    a genuinely new head/eye position, matching how it's actually used.
+    perfectly. That systematically selects too little regularization.
+    Leaving out one whole calibration point per fold forces the model to
+    generalize to a genuinely new head/eye position, matching how it's
+    actually used.
 
     x and y are fit as two independent RidgeCV models sharing one
     preprocessing pipeline (rather than one multi-output RidgeCV with
     alpha_per_target) because sklearn's alpha_per_target optimization only
     applies to the default fast leave-one-out path, not to an explicit
     custom `cv` -- and a custom group-aware cv is exactly the point here.
-
-    Local residual correction on top: after fitting the global linear
-    model, this stores each training sample's residual (true target minus
-    the global model's prediction for it) alongside its transformed feature
-    vector. At prediction time, it finds the K nearest calibration samples
-    (in transformed feature space) to the live input and blends a
-    distance-weighted average of *their* residuals into the global
-    prediction -- weighted down to near-zero for a live input that's far
-    from any calibration sample, so it can only ever nudge the global
-    model's prediction, never override it far from real training data.
-    This is deliberately NOT a global nonlinear model (that's what the
-    rejected degree-2 polynomial was, and why it extrapolated so badly): it
-    can only correct in neighborhoods where enough real calibration data
-    actually exists, which is exactly where nonlinear correction is
-    trustworthy and where a global polynomial's extrapolation risk doesn't
-    apply. Conceptually similar to how some webcam gaze trackers blend a
-    coarse/robust estimate with a more precise local one -- this is our own
-    independent implementation of that general idea (KNN residual
-    blending), not borrowed code.
     """
 
     def __init__(
@@ -178,8 +165,8 @@ class GazeCalibrator:
         per-sample LOO, which is known to under-regularize on this data."""
         if features.shape[0] < MIN_CALIBRATION_SAMPLES:
             raise ValueError(
-                f"Need at least {MIN_CALIBRATION_SAMPLES} samples for a stable polynomial "
-                f"Ridge fit, got {features.shape[0]}"
+                f"Need at least {MIN_CALIBRATION_SAMPLES} samples for a stable Ridge fit, "
+                f"got {features.shape[0]}"
             )
 
         X = self._preprocessor.fit_transform(features)

@@ -27,7 +27,7 @@ LEFT_EYE_BOTTOM = 145
 RIGHT_EYE_TOP = 386
 RIGHT_EYE_BOTTOM = 374
 
-DEFAULT_MIN_EYE_ASPECT_RATIO = 0.08
+DEFAULT_MIN_EYE_ASPECT_RATIO = 0.12
 
 
 @dataclass
@@ -60,8 +60,8 @@ def compute_gaze_feature(points_px: np.ndarray, frame_gray: np.ndarray | None = 
     classical image-processing check/refinement layered on top of
     MediaPipe's landmark, which falls back to the landmark unchanged
     whenever the refinement doesn't pass its own confidence check. Pass
-    None (the default) to use the landmark position directly, e.g. for
-    callers without easy access to the raw frame.
+    None to use the landmark position directly (e.g. for callers without
+    easy access to the raw frame).
     """
     left_outer, left_inner, left_iris = (
         points_px[LEFT_EYE_OUTER],

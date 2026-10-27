@@ -4,9 +4,10 @@ Gaze/head-tracking, content-aware auto-scroll. Uses your webcam + MediaPipe
 face landmarks to figure out where on screen you're looking, and scrolls the
 focused window when you dwell near the bottom edge.
 
-This is Phase 2 of the project: calibrated gaze mapping + a naive dwell
-trigger ("look at the bottom 15% of the focused window for 1s -> scroll
-down"). No content-awareness yet.
+This is Phase 2 of the project: a trained gaze model (or per-user calibration)
++ an out-of-distribution confidence gate + a naive dwell trigger ("look at the
+bottom 15% of the focused window for 1s -> scroll down"). No content-awareness
+yet (that's Phase 3/4 — see [Project layout](#project-layout)).
 
 ## Requirements
 
@@ -32,11 +33,11 @@ pip install -e ".[windows]"
 If `pyobjc` fails to build on macOS, install the Xcode command-line tools
 first: `xcode-select --install`.
 
-
-
 ```bash
 pip install "mediapipe==0.10.31"
 ```
+
+(Or just `uv sync` — a `uv.lock` is checked in.)
 
 ### macOS permissions
 
@@ -70,15 +71,15 @@ Run everything from the project root, with the venv activated.
    focused; validates event injection before anything else is built on it.
    Skip this on macOS.
 
-4. **`python scripts/calibrate.py`** — 16-point on-screen gaze calibration.
-   Keep your head still and facing forward; move only your eyes to follow
-   each dot. Ends with a validation pass reporting mean pixel error. Press
-   `ESC` to abort.
+4. **`python scripts/calibrate.py`** — multi-angle on-screen gaze
+   calibration. Keep your head still at each block's orientation and move
+   only your eyes to follow each dot. Ends with a validation pass reporting
+   mean pixel error. Press `ESC` to abort.
 
 5. **`python scripts/phase2_gaze_scroll.py`** — the real thing. Run
-   calibration first. Click into a browser/PDF/other scrollable app to focus
-   it, then look toward the bottom of that window for about a second. Press
-   `q` in the debug window to quit.
+   calibration first (or use `--model`, see below). Click into a
+   browser/PDF/other scrollable app to focus it, then look toward the bottom
+   of that window for about a second. Press `q` in the debug window to quit.
 
 The debug overlay in step 5 prints live status (head pose, gaze fraction,
 dwell progress) on the frame, and prints `SCROLL triggered` to the console
@@ -86,10 +87,20 @@ each time a scroll fires — useful for telling apart "the trigger never
 fires" (calibration/window-bounds issue) from "it fires but nothing scrolls"
 (permissions/injection issue).
 
+### Tests
+
+```bash
+pytest tests
+```
+
+No camera/MediaPipe needed — `tests/test_recording_pipeline.py` runs the
+record -> build-dataset -> train pipeline end to end against fake camera,
+cursor, and feature-extractor fixtures.
+
 ## Training our own gaze model
 
 Record webcam + cursor, build features, train, run with `--model`. Full
-explanation (how sync works, how to collect data, how to evaluate) in
+explanation (how sync works, how to collect data, how to evaluate) is in
 [`docs/ML_PIPELINE.md`](docs/ML_PIPELINE.md).
 
 ```bash
@@ -97,8 +108,23 @@ python scripts/record_session.py --participant <name> --duration 300
 python scripts/build_dataset.py
 python scripts/train_model.py --sweep-lag
 python scripts/quick_calibrate.py            # optional, ~15 s
-python scripts/phase2_gaze_scroll.py --model
+python scripts/phase2_gaze_scroll.py --model models/gaze_model_4person.joblib
 ```
+
+`train_model.py` writes to `models/gaze_model.joblib` by default — that path
+is git-ignored (see [What's not committed](#whats-not-committed)), so a fresh
+clone must either retrain locally or point `--model` at the committed
+`models/gaze_model_4person.joblib`.
+
+Evaluation/analysis scripts (all write into `lab_analysis/`, which is also
+git-ignored — regenerate as needed):
+
+- `scripts/evaluate_pipeline.py` — leave-person-out error for the production
+  pipeline (raw HGB vs. + quick calibration vs. + calibration + OOD gate).
+- `scripts/evaluate_ood.py` — sweeps out-of-distribution detector methods
+  (mahalanobis / isolation forest / LOF) and rejection thresholds.
+- `scripts/compare_ridge_hgb_pipeline.py` — leave-one-participant-out
+  comparison of ridge vs. HGB through the full production pipeline.
 
 ## Known issues & fixes already applied here
 
@@ -128,12 +154,38 @@ python scripts/phase2_gaze_scroll.py --model
 src/doomscroll/
   capture/      webcam frame source
   landmarks/    MediaPipe face-landmark backend
-  gaze/         gaze vector, head pose, calibration, smoothing
+  gaze/         gaze vector, head pose, calibration (quick + full), pupil
+                refinement, smoothing, trajectory paths, session storage
   fixation/     attention gate + window-relative mapping
-  recording/    data collection: webcam + cursor recorder, session format
-  ml/           features, labels, dataset building, training, trained-model wrapper
+  recording/    data collection: webcam + cursor recorder, session format,
+                optional screen recording
+  ml/           features, labels, dataset building, training, trained-model
+                wrapper, OOD (out-of-distribution) gating
   scroll/       platform scroll injectors (Windows/macOS)
   windowing/    platform focused-window-bounds providers (Windows/macOS)
-scripts/        the test/validation scripts described above
-models/         face_landmarker.task (MediaPipe model, already included)
+  debug/        live debug overlay (head pose, gaze, dwell progress)
+  config/       (reserved — empty placeholder)
+  content/      (reserved — Phase 3/4 content-awareness, not implemented yet)
+  dpi.py        DPI/screen-scaling helpers
+scripts/        the test/validation/training/evaluation scripts described above
+models/         face_landmarker.task (MediaPipe model) + the committed
+                production gaze model (see below)
+docs/           ML_PIPELINE.md — data collection, training, evaluation deep-dive
+tests/          pytest suite (fakes everything camera/MediaPipe-related)
 ```
+
+## What's not committed
+
+`.gitignore` excludes, on top of the usual Python build/cache artifacts:
+
+| Path | Why |
+|---|---|
+| `data/` | Raw webcam recordings and `.npz` training datasets — personal/biometric data (face video). Never commit; share privately, with consent. |
+| `lab_analysis/` | Generated evaluation CSVs/PNGs/frame crops from the scripts above — regenerate locally rather than committing stale output. |
+| `lab3/` | Lab-course deliverables (diagrams, reports) unrelated to the running application. |
+| `models/gaze_model.joblib`, `models/gaze_model_qiyun_ysabelle.joblib`, `models/gaze_model_jingyi_qiyun_ysabelle.joblib` | Superseded/intermediate trained models. |
+
+Still committed: `models/face_landmarker.task` (MediaPipe's model, required to
+run anything) and `models/gaze_model_4person.joblib` (the current production
+model — pass it explicitly via `--model`, since it isn't the default output
+path of `train_model.py`).

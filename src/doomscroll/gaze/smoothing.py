@@ -29,7 +29,7 @@ screen corners even with steady gaze:
    low perceived latency (predict where you'll be next, don't wait for
    correction), but it trades away stability: if the velocity state is ever
    noisy, the displayed point extrapolates from that noise every frame
-   before correction ever reins it back in. gazescroll's dwell trigger cares
+   before correction ever reins it back in. doomscroll's dwell trigger cares
    about stability far more than latency, so this returns the corrected
    (post-measurement) state instead.
 """
@@ -74,7 +74,7 @@ class KalmanSmoother:
 
     EyeTrax's default measurement_var=0.2 trusts each raw measurement
     heavily, which is appropriate for a live gaze-cursor use case prioritizing
-    responsiveness. gazescroll's dwell/pattern-based scroll trigger cares more
+    responsiveness. doomscroll's dwell/pattern-based scroll trigger cares more
     about rejecting single-frame outliers (a blink-corrupted landmark, a
     brief head jerk) than about minimizing lag -- and naive Kalman correction
     is actually worse than no filtering for that: an outlier measurement gets

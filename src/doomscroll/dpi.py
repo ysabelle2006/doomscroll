@@ -31,31 +31,27 @@ def ensure_dpi_aware() -> None:
 
 
 def get_screen_size() -> tuple[int, int]:
-    """True physical screen size -- call ensure_dpi_aware() first, or this
-    returns the same virtualized/scaled-down size described above.
+    """True physical screen size -- call ensure_dpi_aware() first on
+    Windows, or this returns the same virtualized/scaled-down size
+    described above.
 
-    On macOS this queries Quartz directly instead of going through Tkinter.
-    Tk's winfo_screenwidth()/winfo_screenheight() has been observed to
-    disagree with the screen size AppKit/Cocoa windows actually use -- off
-    by several dozen pixels, usually in width, on displays using a
-    non-native "scaled" resolution -- which left a stray grey strip along
-    one edge of the OpenCV fullscreen calibration window uncovered by our
-    own rendered frame (OpenCV's highgui window on macOS is itself a Cocoa
-    window under the hood, so querying the same framework Cocoa uses keeps
-    the two in agreement). Falls back to the Tk-based query if pyobjc/Quartz
-    isn't available for any reason.
+    On macOS, tkinter's winfo_screenwidth/height is a separate, known-
+    unreliable source on Retina/scaled-resolution setups -- observed as a
+    persistent blank strip along one edge of calibrate.py's fullscreen
+    window, because the drawn canvas (sized to this function's return
+    value) doesn't actually reach that edge of the real display. Quartz's
+    CGDisplayBounds is queried directly instead: it's the same native
+    display-bounds API macOS's window server (and therefore OpenCV's
+    Cocoa-backed fullscreen window) actually uses, so it should agree with
+    reality by construction rather than through a second toolkit's (tkinter's)
+    possibly-stale idea of the screen size.
     """
     if sys.platform == "darwin":
-        try:
-            import Quartz
+        import Quartz
 
-            display_id = Quartz.CGMainDisplayID()
-            w = Quartz.CGDisplayPixelsWide(display_id)
-            h = Quartz.CGDisplayPixelsHigh(display_id)
-            if w and h:
-                return int(w), int(h)
-        except Exception:
-            pass  # fall through to the Tk-based query below
+        display_id = Quartz.CGMainDisplayID()
+        bounds = Quartz.CGDisplayBounds(display_id)
+        return int(bounds.size.width), int(bounds.size.height)
 
     import tkinter as tk
 

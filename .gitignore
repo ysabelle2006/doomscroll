@@ -1,6 +1,24 @@
 .venv/
 __pycache__/
+*.py[cod]
 *.egg-info/
+build/
+.claude/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
 .DS_Store
+Thumbs.db
 # Face videos are personal data: never commit recordings or datasets.
 data/
+lab_analysis/
+lab1/
+lab2/
+lab3/
+models/gaze_model_jingyi_qiyun_ysabelle.joblib
+models/gaze_model_qiyun_ysabelle.joblib
+models/gaze_model.joblib
+
