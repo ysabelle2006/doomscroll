@@ -73,6 +73,21 @@ def pixel_errors(pred_frac: np.ndarray, true_frac: np.ndarray, screen_wh: np.nda
     return np.linalg.norm((pred_frac - true_frac) * screen_wh, axis=1)
 
 
+def diagonal_px(screen_wh: np.ndarray) -> np.ndarray:
+    """Per-sample screen diagonal, in pixels -- the normalizer for cross-participant/
+
+    cross-resolution comparable error. Different participants recording on different
+    screen resolutions (e.g. 3200x2000 vs 1512x982) make raw pixel error incomparable
+    between them; dividing by each sample's own diagonal fixes that."""
+    return np.linalg.norm(screen_wh, axis=1)
+
+
+def normalized_errors(pred_frac: np.ndarray, true_frac: np.ndarray, screen_wh: np.ndarray) -> np.ndarray:
+    """Error as a fraction of that sample's screen diagonal -- resolution-independent,
+    comparable across participants/screens. Multiply by 100 for a percentage."""
+    return pixel_errors(pred_frac, true_frac, screen_wh) / diagonal_px(screen_wh)
+
+
 def out_of_fold_predictions(factory, data: Pooled, n_splits: int = 5) -> np.ndarray:
     n_groups = len(np.unique(data.groups))
     if n_groups < 2:
@@ -85,26 +100,37 @@ def out_of_fold_predictions(factory, data: Pooled, n_splits: int = 5) -> np.ndar
     return pred
 
 
-def error_by_yaw(errors: np.ndarray, yaw_deg: np.ndarray) -> list[tuple[str, int, float]]:
-    """Mean px error per head-yaw bin: the direct measure of the head-angle problem."""
+def error_by_yaw(err_px: np.ndarray, err_norm: np.ndarray, yaw_deg: np.ndarray) -> list[dict]:
+    """Mean error per head-yaw bin, in BOTH units: the direct measure of the
+    head-angle problem. err_norm (fraction of screen diagonal) is the
+    resolution-independent figure -- prefer it when comparing across
+    participants/screens; err_px is kept for backwards comparison."""
     rows = []
     for lo, hi in zip(YAW_BINS_DEG[:-1], YAW_BINS_DEG[1:]):
         m = (yaw_deg >= lo) & (yaw_deg < hi)
         if m.any():
-            rows.append((f"yaw [{lo:+d},{hi:+d})", int(m.sum()), float(errors[m].mean())))
+            rows.append({
+                "label": f"yaw [{lo:+d},{hi:+d})", "n": int(m.sum()),
+                "mean_px": float(err_px[m].mean()), "mean_pct": float(err_norm[m].mean()) * 100,
+            })
     return rows
 
 
 def evaluate_candidates(data: Pooled, names: list[str] | None = None) -> dict[str, dict]:
-    """-> {name: {"mean_px", "median_px", "p90_px", "by_yaw"}} from out-of-fold predictions."""
+    """-> {name: {mean/median/p90 in both _px and _pct (= % of screen diagonal,
+    the resolution-independent/primary figure -- see normalized_errors), "by_yaw"}}
+    from out-of-fold predictions."""
     report = {}
     for name in names or list(CANDIDATES):
         pred = out_of_fold_predictions(CANDIDATES[name], data)
-        err = pixel_errors(pred, data.y, data.screen_wh)
+        err_px = pixel_errors(pred, data.y, data.screen_wh)
+        err_norm = err_px / diagonal_px(data.screen_wh)  # same err_px, no second model pass
         report[name] = {
-            "mean_px": float(err.mean()), "median_px": float(np.median(err)),
-            "p90_px": float(np.percentile(err, 90)),
-            "by_yaw": error_by_yaw(err, data.X[:, YAW_INDEX]),
+            "mean_px": float(err_px.mean()), "median_px": float(np.median(err_px)),
+            "p90_px": float(np.percentile(err_px, 90)),
+            "mean_pct": float(err_norm.mean()) * 100, "median_pct": float(np.median(err_norm)) * 100,
+            "p90_pct": float(np.percentile(err_norm, 90)) * 100,
+            "by_yaw": error_by_yaw(err_px, err_norm, data.X[:, YAW_INDEX]),
         }
     return report
 

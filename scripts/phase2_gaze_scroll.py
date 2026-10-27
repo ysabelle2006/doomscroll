@@ -19,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -28,11 +29,13 @@ from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.fixation.attention_gate import AttentionGate
 from doomscroll.fixation.mapper import to_window_relative_fraction
 from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
+from doomscroll.gaze.full_calibration import DEFAULT_FULL_CALIBRATION_PATH, FullCalibrator
 from doomscroll.gaze.gaze_vector import compute_gaze_feature, is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.gaze.smoothing import GazePointSmoother
 from doomscroll.ml.features import extract_features
 from doomscroll.ml.model import DEFAULT_CORRECTION_PATH, DEFAULT_MODEL_PATH, TrainedGazeModel
+from doomscroll.ml.ood import GazeConfidenceGate
 from doomscroll.landmarks.mediapipe_backend import LEFT_IRIS, RIGHT_IRIS, MediaPipeLandmarkBackend
 from doomscroll.scroll import ScrollUnit, get_scroll_injector
 from doomscroll.windowing import get_window_bounds_provider
@@ -54,22 +57,58 @@ DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"
 EXTRAPOLATION_MARGIN = 0.5  # allow up to 50% of screen size beyond each edge
 
 
-def make_predictor(use_trained_model: bool, model_path: Path, screen_wh: tuple[int, int]):
-    """-> fn(points_px, head_pose, frame_gray) -> raw screen point (px).
-    One seam for both gaze models, so the main loop doesn't care which is used."""
+def make_predictor(
+    use_trained_model: bool,
+    model_path: Path,
+    screen_wh: tuple[int, int],
+    full_calibration_path: Path | None = None,
+):
+    """-> (fn(points_px, head_pose, frame_gray) -> dict with raw/corrected/point_px/ood_score,
+            gate_threshold or None).
+    One seam for all three gaze models, so the main loop doesn't care which is used. Only the
+    trained-model path has an OOD detector (ood_score always None otherwise -> gate is a no-op,
+    GazeConfidenceGate always decides "trust")."""
+    if full_calibration_path is not None:
+        full_calibrator = FullCalibrator.load(full_calibration_path)
+        print(f"Using --full calibration profile {full_calibration_path}")
+
+        def predict(points_px, pose, gray):
+            feature = extract_features(points_px, pose, gray)
+            frac = full_calibrator.predict(feature)
+            wh = np.array(screen_wh, dtype=np.float64)
+            point_px = frac * wh
+            return {"raw_px": point_px, "corrected_px": point_px, "point_px": point_px, "ood_score": None}
+
+        return predict, None
+
     if use_trained_model:
         model = TrainedGazeModel.load(model_path, correction_path=DEFAULT_CORRECTION_PATH)
         print(f"Using trained model {model.metadata.get('kind')!r}"
-              f"{' + per-user correction' if model.correction else ''}")
-        return lambda points_px, pose, gray: model.predict_px(extract_features(points_px, pose, gray), screen_wh)
+              f"{' + per-user correction' if model.correction else ''}"
+              f"{' + OOD gate' if model.ood_detector is not None else ' (no OOD detector in this model file)'}")
+
+        def predict(points_px, pose, gray):
+            feature = extract_features(points_px, pose, gray)
+            stages = model.predict_frac_stages(feature)
+            wh = np.array(screen_wh, dtype=np.float64)
+            return {
+                "raw_px": stages["raw"] * wh,
+                "corrected_px": stages["corrected"] * wh,
+                "point_px": stages["clamped"] * wh,
+                "ood_score": stages["ood_score"],
+            }
+
+        threshold = model.metadata.get("ood_threshold_default")
+        return predict, threshold
 
     calibrator = GazeCalibrator.load()
 
     def predict(points_px, pose, gray):
         gaze = compute_gaze_feature(points_px, frame_gray=gray)
-        return calibrator.predict(build_feature_vector(gaze.vector, (pose.yaw_deg, pose.pitch_deg, pose.roll_deg)))
+        point = calibrator.predict(build_feature_vector(gaze.vector, (pose.yaw_deg, pose.pitch_deg, pose.roll_deg)))
+        return {"raw_px": point, "corrected_px": point, "point_px": point, "ood_score": None}
 
-    return predict
+    return predict, None
 
 
 def main() -> None:
@@ -77,7 +116,20 @@ def main() -> None:
     ap.add_argument("--model", nargs="?", const=str(DEFAULT_MODEL_PATH), default=None, metavar="PATH",
                     help="use a model trained by scripts/train_model.py (default path if no value) "
                          "instead of the calibrate.py profile")
+    ap.add_argument("--full-calibration", nargs="?", const=str(DEFAULT_FULL_CALIBRATION_PATH), default=None,
+                    metavar="PATH",
+                    help="use the RidgeCV profile fitted by `quick_calibrate.py --full` (default path if no "
+                         "value) instead of --model or the calibrate.py profile; takes priority over --model.")
+    ap.add_argument("--gate-threshold", type=float, default=None,
+                    help="override the OOD gate's default threshold (from the model file's metadata)")
+    ap.add_argument("--gate-hold-ms", type=float, default=1500.0,
+                    help="how long to hold the last trusted point before suppressing (GazeConfidenceGate)")
+    ap.add_argument("--no-gate", action="store_true", help="disable the OOD confidence gate even if the model has a detector")
+    ap.add_argument("--log-level", default="INFO", help="loguru level, e.g. DEBUG to see per-frame pipeline stages")
     args = ap.parse_args()
+    logger.remove()
+    logger.add(sys.stderr, level=args.log_level,
+                format="{time:HH:mm:ss.SSS} | {level: <7} | {message}")
 
     ensure_dpi_aware()
     screen_w, screen_h = get_screen_size()
@@ -85,14 +137,36 @@ def main() -> None:
     clamp_y = (-EXTRAPOLATION_MARGIN * screen_h, (1 + EXTRAPOLATION_MARGIN) * screen_h)
 
     try:
-        predict_gaze = make_predictor(args.model is not None, Path(args.model or DEFAULT_MODEL_PATH), (screen_w, screen_h))
+        predict_gaze, gate_threshold = make_predictor(
+            args.model is not None,
+            Path(args.model or DEFAULT_MODEL_PATH),
+            (screen_w, screen_h),
+            full_calibration_path=Path(args.full_calibration) if args.full_calibration is not None else None,
+        )
     except FileNotFoundError as e:
         print(e)
         sys.exit(1)
 
+    if args.gate_threshold is not None:
+        gate_threshold = args.gate_threshold
+    confidence_gate = None
+    if not args.no_gate and gate_threshold is not None:
+        confidence_gate = GazeConfidenceGate(threshold=gate_threshold, max_hold_ms=args.gate_hold_ms)
+        logger.info(f"OOD confidence gate enabled: threshold={gate_threshold:.3f} max_hold_ms={args.gate_hold_ms:.0f}")
+    elif not args.no_gate:
+        logger.warning("No OOD detector in this model file -- confidence gate disabled (retrain with "
+                        "train_model.py's default --ood-method, or pass --gate-threshold explicitly).")
+
     backend = MediaPipeLandmarkBackend()
     pose_estimator = HeadPoseEstimator()
-    smoother = GazePointSmoother()
+    # The default max_innovation=120px is tuned for the calibrate.py profile's
+    # much smaller error. The trained ML model's held-out error is ~900px mean
+    # (up to ~1700px p90), so that gate rejects legitimate corrections after a
+    # bad patch of predictions as if they were noise -- the smoother gets
+    # stuck near wherever it last drifted to instead of recovering. Widen the
+    # gate to comfortably above the model's own p90 error when it's in use.
+    use_wide_innovation_gate = args.model is not None or args.full_calibration is not None
+    smoother = GazePointSmoother(max_innovation=1000.0) if use_wide_innovation_gate else GazePointSmoother()
     attention_gate = AttentionGate()
     window_provider = get_window_bounds_provider()
     injector = get_scroll_injector()
@@ -133,18 +207,49 @@ def main() -> None:
             if paused:
                 status_lines.append("PAUSED (looking away)")
                 smoother.reset()
+                if confidence_gate is not None:
+                    confidence_gate.reset()
                 dwell_start_ms = None
             elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px):
                 status_lines.append("blink...")
             elif points_px is not None and head_pose is not None:
                 frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                raw_point = predict_gaze(points_px, head_pose, frame_gray)
+                pred = predict_gaze(points_px, head_pose, frame_gray)
+                raw_point = pred["point_px"]  # post-correction, pre-extrapolation-clamp
                 clamped_point = np.array(
                     [np.clip(raw_point[0], *clamp_x), np.clip(raw_point[1], *clamp_y)]
                 )
                 if not np.array_equal(clamped_point, raw_point):
                     status_lines.append(f"!! prediction clamped from raw=({raw_point[0]:.0f},{raw_point[1]:.0f})")
-                smoothed_point = smoother.update(clamped_point, timestamp_ms)
+
+                # --- fail-safe confidence gate (task C) ---
+                gate_decision = "trust"
+                gated_point = clamped_point
+                if confidence_gate is not None and pred["ood_score"] is not None:
+                    gate_decision, gated_point = confidence_gate.decide(pred["ood_score"], clamped_point, timestamp_ms)
+
+                logger.debug(
+                    "frame={} raw_px=({:.0f},{:.0f}) corrected_px=({:.0f},{:.0f}) ood_score={} "
+                    "gate={} final_px={}",
+                    timestamp_ms, pred["raw_px"][0], pred["raw_px"][1],
+                    pred["corrected_px"][0], pred["corrected_px"][1],
+                    f"{pred['ood_score']:.3f}" if pred["ood_score"] is not None else "n/a",
+                    gate_decision,
+                    f"({gated_point[0]:.0f},{gated_point[1]:.0f})" if gated_point is not None else "none (suppressed)",
+                )
+
+                if gate_decision == "suppress":
+                    status_lines.append(f"LOW CONFIDENCE (score={pred['ood_score']:.2f}) -- suppressed, holding too long")
+                    dwell_start_ms = None
+                    draw_status_lines(frame, status_lines)
+                    cv2.imshow("doomscroll - Phase 2", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
+                if gate_decision == "hold":
+                    status_lines.append(f"LOW CONFIDENCE (score={pred['ood_score']:.2f}) -- holding last trusted point")
+
+                smoothed_point = smoother.update(gated_point, timestamp_ms)
 
                 current_bounds = window_provider.get_focused_window_bounds()
                 # Our own debug preview window can itself become the OS

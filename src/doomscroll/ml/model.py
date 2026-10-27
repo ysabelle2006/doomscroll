@@ -20,6 +20,7 @@ import numpy as np
 from platformdirs import user_data_dir
 
 from doomscroll.ml.features import FEATURE_NAMES
+from doomscroll.ml.ood import OODDetector
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[3] / "models" / "gaze_model.joblib"
 DEFAULT_CORRECTION_PATH = Path(user_data_dir("doomscroll")) / "calibration" / "affine_correction.json"
@@ -59,24 +60,48 @@ class AffineCorrection:
 
 
 class TrainedGazeModel:
-    def __init__(self, estimator, metadata: dict | None = None, correction: AffineCorrection | None = None):
+    def __init__(
+        self,
+        estimator,
+        metadata: dict | None = None,
+        correction: AffineCorrection | None = None,
+        ood_detector: OODDetector | None = None,
+    ):
         self.estimator = estimator  # sklearn regressor: (N, FEATURE_DIM) -> (N, 2) fractions
         self.metadata = metadata or {}
         self.correction = correction
+        self.ood_detector = ood_detector  # see ml/ood.py; None = no confidence gating available
+
+    def predict_frac_stages(self, feature: np.ndarray) -> dict:
+        """-> {"raw": .., "corrected": .., "clamped": .., "ood_score": .. or None}.
+        One place that does the raw->correction->clamp pipeline, so predict_frac()
+        and any caller that needs the intermediate values (logging, the confidence
+        gate) can't drift apart."""
+        raw = self.estimator.predict(feature.reshape(1, -1))[0]
+        corrected = self.correction.apply(raw) if self.correction is not None else raw
+        clamped = np.clip(corrected, *CLAMP_FRAC)
+        score = float(self.ood_detector.score(feature.reshape(1, -1))[0]) if self.ood_detector is not None else None
+        return {"raw": raw, "corrected": corrected, "clamped": clamped, "ood_score": score}
 
     def predict_frac(self, feature: np.ndarray) -> np.ndarray:
-        frac = self.estimator.predict(feature.reshape(1, -1))[0]
-        if self.correction is not None:
-            frac = self.correction.apply(frac)
-        return np.clip(frac, *CLAMP_FRAC)
+        return self.predict_frac_stages(feature)["clamped"]
 
     def predict_px(self, feature: np.ndarray, screen_wh: tuple[int, int]) -> np.ndarray:
         return self.predict_frac(feature) * np.array(screen_wh, dtype=np.float64)
 
+    def ood_score(self, feature: np.ndarray) -> float | None:
+        if self.ood_detector is None:
+            return None
+        return float(self.ood_detector.score(feature.reshape(1, -1))[0])
+
     def save(self, path: Path | str = DEFAULT_MODEL_PATH) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"estimator": self.estimator, "metadata": self.metadata, "feature_names": FEATURE_NAMES}, path)
+        joblib.dump(
+            {"estimator": self.estimator, "metadata": self.metadata, "feature_names": FEATURE_NAMES,
+             "ood_detector": self.ood_detector},
+            path,
+        )
 
     @classmethod
     def load(cls, path: Path | str = DEFAULT_MODEL_PATH, correction_path: Path | str | None = None) -> "TrainedGazeModel":
@@ -89,7 +114,7 @@ class TrainedGazeModel:
         correction = None
         if correction_path is not None and Path(correction_path).exists():
             correction = AffineCorrection.load(Path(correction_path))
-        return cls(data["estimator"], data["metadata"], correction)
+        return cls(data["estimator"], data["metadata"], correction, data.get("ood_detector"))
 
 
 def fit_user_correction(
