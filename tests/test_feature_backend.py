@@ -1,24 +1,14 @@
-"""Tests for doomscroll.gaze.feature_backend: the --features dispatch that
-lets scripts/calibrate.py and scripts/phase2_gaze_scroll.py swap between the
-hand-crafted eye-vector and L2CS-Net's appearance-based estimate at one
-call site, without either script needing to know which is active.
+"""Tests for doomscroll.gaze.feature_backend: the gaze-vector-pipeline
+dispatch used by scripts/calibrate.py and scripts/phase2_gaze_scroll.py.
 
-HandcraftedGazeExtractor is pure/fast and tested directly. L2CSGazeExtractor
-needs torch/torchvision/safetensors (the `l2cs` extra) -- not installed in
-this sandbox -- so it's tested only for the error path: make_gaze_extractor
-must fail with a clear, actionable RuntimeError (pointing at `uv sync
---extra l2cs`) rather than a bare ImportError/ModuleNotFoundError, when
-those aren't installed. Its actual model-loading/inference behavior needs
-checking on a real machine with the extra installed -- see
-test_l2cs_backend.py's module docstring.
+HandcraftedGazeExtractor is the only backend and is pure/fast, so it's
+tested directly.
 """
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from doomscroll.gaze.feature_backend import (
-    FEATURE_BACKEND_NAMES,
     HandcraftedGazeExtractor,
     make_gaze_extractor,
 )
@@ -41,10 +31,6 @@ def _four_point_eyes() -> np.ndarray:
     return points
 
 
-def test_feature_backend_names_lists_both_backends():
-    assert set(FEATURE_BACKEND_NAMES) == {"handcrafted", "l2cs"}
-
-
 def test_handcrafted_extractor_name():
     assert HandcraftedGazeExtractor().name == "handcrafted"
 
@@ -62,27 +48,6 @@ def test_handcrafted_extractor_matches_compute_gaze_feature_directly():
     assert vector.shape == (4,)
 
 
-def test_make_gaze_extractor_handcrafted_returns_handcrafted_instance():
-    extractor = make_gaze_extractor("handcrafted")
+def test_make_gaze_extractor_returns_handcrafted_instance():
+    extractor = make_gaze_extractor()
     assert isinstance(extractor, HandcraftedGazeExtractor)
-
-
-def test_make_gaze_extractor_unknown_name_raises_clear_error():
-    with pytest.raises(ValueError, match="Unknown --features backend"):
-        make_gaze_extractor("not-a-real-backend")
-
-
-def test_make_gaze_extractor_l2cs_without_torch_installed_raises_actionable_error():
-    """In any environment without the `l2cs` extra installed (this sandbox
-    included), selecting l2cs must fail loudly with a message that tells
-    you how to fix it, not a bare ImportError from deep inside
-    l2cs_backend.py."""
-    try:
-        import torch  # noqa: F401
-
-        pytest.skip("torch is installed in this environment -- this test only applies when it's absent")
-    except ImportError:
-        pass
-
-    with pytest.raises(RuntimeError, match="uv sync --extra l2cs"):
-        make_gaze_extractor("l2cs")

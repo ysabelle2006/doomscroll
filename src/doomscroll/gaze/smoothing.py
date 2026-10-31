@@ -1,37 +1,24 @@
-"""Kalman filtering for the mapped screen-space gaze point.
+"""Kalman filtering for the mapped screen-space gaze point: a 4-state
+constant-velocity model ([x, y, vx, vy], measuring [x, y]), with
+innovation gating against single-frame outliers, optionally followed by
+a light EMA pass. Process/measurement noise are tuned as an explicit
+trust tradeoff, and the velocity state lets the filter anticipate smooth
+motion while damping single-frame jumps.
 
-Adapted from EyeTrax's filter design
-(https://github.com/ck-zhang/EyeTrax/tree/master/src/eyetrax/filters):
-a 4-state constant-velocity model ([x, y, vx, vy], measuring [x, y]),
-optionally followed by a light EMA pass (their KalmanEMASmoother). This
-replaces an earlier median+EMA heuristic -- a properly modeled Kalman
-filter is the more principled way to satisfy "incidental head movement
-should not throw off gaze-position estimation": process/measurement noise
-are tuned as an explicit trust tradeoff rather than an ad hoc deadband, and
-the velocity state lets the filter anticipate smooth motion while damping
-single-frame jumps.
+KalmanSmoother.update() sets dt (the transition matrix's velocity
+coupling) from the actual elapsed time between calls, since the capture
+loop doesn't run at a fixed rate. dt is clamped to a maximum (MAX_DT_S),
+since an unclamped dt during a processing hiccup (a blink, a slow
+inference tick) would make the constant-velocity extrapolation
+overconfident: position error from accumulated velocity noise grows
+linearly with dt, while an unscaled processNoiseCov doesn't account for
+the extra elapsed-time uncertainty.
 
-Two further deviations from EyeTrax's reference implementation, both found
-empirically while tuning this against live tracking that was drifting to
-screen corners even with steady gaze:
-
-1. EyeTrax's transition matrix assumes a fixed dt=1.0 per call. This
-   project's capture loop doesn't run at a fixed rate, so
-   KalmanSmoother.update() sets dt from the actual elapsed time between
-   frames -- but dt is now also clamped to a maximum, since an unclamped
-   dt during a processing hiccup (a blink, a slow inference tick) makes the
-   constant-velocity extrapolation overconfident: position error from
-   accumulated velocity noise grows linearly with dt, while an unscaled
-   processNoiseCov doesn't account for the extra elapsed-time uncertainty.
-2. EyeTrax's step() returns kf.predict()'s pre-correction output rather
-   than the state after kf.correct(measurement) incorporates the fresh
-   measurement. That's a reasonable choice for a live cursor prioritizing
-   low perceived latency (predict where you'll be next, don't wait for
-   correction), but it trades away stability: if the velocity state is ever
-   noisy, the displayed point extrapolates from that noise every frame
-   before correction ever reins it back in. gazescroll's dwell trigger cares
-   about stability far more than latency, so this returns the corrected
-   (post-measurement) state instead.
+update() returns the corrected (post-measurement) state rather than
+predict()'s pre-correction output, since this project's dwell trigger
+cares about stability far more than minimizing perceived latency: if the
+velocity state is ever noisy, a pre-correction output would extrapolate
+from that noise every frame before correction reins it back in.
 """
 from __future__ import annotations
 
@@ -69,28 +56,23 @@ def make_kalman_filter(process_var: float = 20.0, measurement_var: float = 0.5) 
 
 
 class KalmanSmoother:
-    """Kalman-filtered gaze point (extends EyeTrax's KalmanSmoother design
-    with innovation gating).
+    """Kalman-filtered gaze point with innovation gating.
 
-    EyeTrax's default measurement_var=0.2 trusts each raw measurement
-    heavily, which is appropriate for a live gaze-cursor use case prioritizing
-    responsiveness. gazescroll's dwell/pattern-based scroll trigger cares more
-    about rejecting single-frame outliers (a blink-corrupted landmark, a
-    brief head jerk) than about minimizing lag -- and naive Kalman correction
-    is actually worse than no filtering for that: an outlier measurement gets
+    This project's dwell/pattern-based scroll trigger cares more about
+    rejecting single-frame outliers (a blink-corrupted landmark, a brief
+    head jerk) than about minimizing lag -- and naive Kalman correction is
+    actually worse than no filtering for that: an outlier measurement gets
     absorbed into the *velocity* state too, causing the filter to overshoot
-    even further on the *next* frame while it "catches up". Innovation gating
-    (a standard robust-Kalman technique) clips how far a single measurement
-    can pull the state before correct() is applied, bounding that damage
-    while leaving normal smooth-motion tracking unaffected.
+    even further on the *next* frame while it "catches up". Innovation
+    gating (a standard robust-Kalman technique) clips how far a single
+    measurement can pull the state before correct() is applied, bounding
+    that damage while leaving normal smooth-motion tracking unaffected.
 
-    This project's own defaults have since moved further from EyeTrax's in
-    the same direction, for the same reason: process_var lower and
-    measurement_var higher than EyeTrax's own values means the filter
-    leans more on its motion model and less on each individual noisy
+    process_var lower and measurement_var higher means the filter leans
+    more on its motion model and less on each individual noisy
     measurement -- less responsive, but visibly less jittery, which is
     what this project's content-aware dwell tracking (gaze needs to sit
-    still on one spot to register as "read") actually benefits from.
+    still on one spot to register as "read") benefits from.
     """
 
     def __init__(self, process_var: float = 20.0, measurement_var: float = 0.5, max_innovation: float = 120.0):
@@ -132,8 +114,8 @@ class KalmanSmoother:
                 meas = (predicted[:2] + (innovation * scale).reshape(2, 1)).astype(np.float32)
 
         self._kf.correct(meas)
-        # Return the corrected (post-measurement) state, not predict()'s
-        # pre-correction output -- see module docstring for why.
+        # Return the corrected (post-measurement) state -- see module
+        # docstring for why.
         return np.array([self._kf.statePost[0, 0], self._kf.statePost[1, 0]], dtype=np.float64)
 
     def reset(self) -> None:
@@ -143,9 +125,8 @@ class KalmanSmoother:
 
 
 class GazePointSmoother(KalmanSmoother):
-    """Kalman output run through a light EMA on top (mirrors EyeTrax's
-    KalmanEMASmoother) for extra smoothness. Kept as the project's default
-    smoother name for drop-in compatibility with existing call sites.
+    """Kalman output run through a light EMA on top, for extra smoothness.
+    Used by scripts/phase2_gaze_scroll.py as the live gaze-point smoother.
 
     ema_alpha: 0.0 disables the EMA pass (pure Kalman output); closer to
     1.0 means stronger smoothing and more lag.

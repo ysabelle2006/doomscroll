@@ -68,7 +68,7 @@ def make_eye_landmarks(
     right_iris_px = right_eye_center + right_offset * RIGHT_EYE_WIDTH
 
     # Vertical eyelid gap of 12px at eye_width=40 gives EAR=0.3 when fully
-    # open (comfortably above DEFAULT_MIN_EYE_ASPECT_RATIO=0.12); scaling it
+    # open (comfortably above DEFAULT_MIN_EYE_ASPECT_RATIO=0.08); scaling it
     # by eye_openness sweeps smoothly down to EAR=0 (clearly closed) at 0.0.
     half_gap_left = 6.0 * eye_openness
     half_gap_right = 6.0 * eye_openness

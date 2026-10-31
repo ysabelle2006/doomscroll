@@ -53,9 +53,9 @@ from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.fixation.attention_gate import AttentionGate
 from doomscroll.fixation.mapper import to_window_relative_fraction
 from doomscroll.fixation.scroll_trigger import ScrollTrigger, ScrollTriggerConfig
-from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector, load_profile_for_backend
-from doomscroll.gaze.feature_backend import FEATURE_BACKEND_NAMES, GazeVectorExtractor, make_gaze_extractor
-from doomscroll.gaze.gaze_vector import is_gaze_usable
+from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
+from doomscroll.gaze.feature_backend import GazeVectorExtractor, make_gaze_extractor
+from doomscroll.gaze.gaze_vector import DEFAULT_MIN_EYE_ASPECT_RATIO, is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.gaze.smoothing import GazePointSmoother
 from doomscroll.landmarks.mediapipe_backend import LEFT_IRIS, RIGHT_IRIS, MediaPipeLandmarkBackend
@@ -63,7 +63,7 @@ from doomscroll.scroll import ScrollUnit, get_scroll_injector
 from doomscroll.windowing import get_window_bounds_provider
 
 SCROLL_STEP_LINES = 6
-DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"  # just a label now -- see windowing/macos_backend.py for how self-focus is actually excluded
+DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"  # a label only -- see windowing/macos_backend.py for how self-focus is actually excluded
 
 # A degree-2 polynomial calibration model has no bound on its output for
 # inputs that drift outside the range seen during calibration. Unlike a
@@ -78,40 +78,21 @@ EXTRAPOLATION_MARGIN = 0.5  # allow up to 50% of screen size beyond each edge
 
 # --- Backend setup -------------------------------------------------------
 #
-# This is the ONLY place in this file that knows --features selected
-# anything: it loads that backend's own saved profile (never the other
-# one's -- see calibration.py's profile_path_for_backend()/
-# load_profile_for_backend(), which is also what makes the two backends
-# fully interchangeable from run to run, with no recalibration needed just
-# because you switched --features since the last run) and builds the
-# matching live feature extractor. Everything below this function --
-# the capture loop, build_feature_vector(), calibrator.predict() -- is
-# backend-agnostic: it just calls gaze_extractor.extract() and trusts
+# Loads the saved calibration profile (see calibration.py's
+# GazeCalibrator.load()) and builds the matching live feature extractor.
+# Everything below this function -- the capture loop, build_feature_vector(),
+# calibrator.predict() -- just calls gaze_extractor.extract() and trusts
 # calibrator was fit on exactly that output shape.
 
 
-def _init_gaze_backend(features: str) -> tuple[GazeCalibrator, GazeVectorExtractor]:
+def _init_gaze_backend() -> tuple[GazeCalibrator, GazeVectorExtractor]:
     try:
-        calibrator = load_profile_for_backend(features)
+        calibrator = GazeCalibrator.load()
     except FileNotFoundError as e:
         print(e)
         sys.exit(1)
 
-    if calibrator.feature_backend != features:
-        # Should be unreachable -- load_profile_for_backend() only ever
-        # returns a profile tagged with exactly this backend, or raises --
-        # but a hand-edited/corrupted profile file is cheap to guard
-        # against explicitly rather than let a shape-mismatch exception
-        # surface from deep inside sklearn.
-        print(
-            f"Internal error: loaded profile for --features {features!r} is actually tagged "
-            f"{calibrator.feature_backend!r}. The profile file may be corrupted -- try recalibrating "
-            f"with `python scripts/calibrate.py --features {features}`."
-        )
-        sys.exit(1)
-
-    print(f"Feature backend: {features}")
-    gaze_extractor = make_gaze_extractor(features)
+    gaze_extractor = make_gaze_extractor()
     return calibrator, gaze_extractor
 
 
@@ -128,15 +109,47 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--features",
-        choices=FEATURE_BACKEND_NAMES,
-        default="handcrafted",
-        help="Which gaze-vector pipeline to predict with live (default: handcrafted). Each backend "
-        "keeps its own saved calibration profile (see calibration.py's profile_path_for_backend()), "
-        "so handcrafted and l2cs are fully interchangeable here -- switching this flag between runs "
-        "never requires recalibrating the other one, as long as you've run scripts/calibrate.py with "
-        "this --features value at least once. 'l2cs' needs torch/torchvision/safetensors installed "
-        "(`uv sync --extra l2cs`) and loads L2CS-Net once at startup, which takes a moment.",
+        "--smoothing-process-var",
+        type=float,
+        default=8.0,
+        help="GazePointSmoother's Kalman process_var (default: 8.0, down from the smoothing "
+        "module's own 20.0 default). Lower = trusts the motion model more / raw measurements "
+        "less -- less per-frame jitter, a bit more lag. Raise this if the point feels sluggish "
+        "to catch up with real eye movement.",
+    )
+    parser.add_argument(
+        "--smoothing-measurement-var",
+        type=float,
+        default=1.5,
+        help="GazePointSmoother's Kalman measurement_var (default: 1.5, up from the smoothing "
+        "module's own 0.5 default). Higher = trusts each raw measurement less -- less jitter, "
+        "more lag.",
+    )
+    parser.add_argument(
+        "--smoothing-ema-alpha",
+        type=float,
+        default=0.7,
+        help="GazePointSmoother's extra EMA pass on top of the Kalman output (default: 0.7, up "
+        "from the smoothing module's own 0.5 default; 0.0 disables it). Higher = smoother, more "
+        "lag.",
+    )
+    parser.add_argument(
+        "--blink-min-ear",
+        type=float,
+        default=DEFAULT_MIN_EYE_ASPECT_RATIO,
+        help=f"Eye-aspect-ratio floor below which a frame is treated as a blink and skipped "
+        f"entirely (not fed to the smoother) rather than updating the gaze point (default: "
+        f"{DEFAULT_MIN_EYE_ASPECT_RATIO}, gaze_vector.py's own default). This is deliberately "
+        "looser than scripts/calibrate.py's CALIBRATION_MIN_EAR (0.12): a narrowed-but-not-"
+        "closed eye (which happens on a genuine downward glance, not just a blink) still gives "
+        "a biased iris reading, but rejecting those frames too eagerly here risks treating a "
+        "real glance as a blink and skipping it. If your gaze point visibly dips and curves "
+        "(a short semicircle/diagonal down-and-back) right around every real blink rather than "
+        "just freezing, that's exactly this gap: a few narrowed-eye frames just before/after "
+        "full closure are passing this looser gate and feeding a biased reading into the "
+        "smoother. Try raising this toward 0.12 (matching calibration) to reject more of "
+        "them -- at the cost of possibly skipping a couple of frames on a fast downward glance "
+        "too, which should be far less noticeable than the dip itself.",
     )
     args = parser.parse_args()
 
@@ -145,11 +158,15 @@ def main() -> None:
     clamp_x = (-EXTRAPOLATION_MARGIN * screen_w, (1 + EXTRAPOLATION_MARGIN) * screen_w)
     clamp_y = (-EXTRAPOLATION_MARGIN * screen_h, (1 + EXTRAPOLATION_MARGIN) * screen_h)
 
-    calibrator, gaze_extractor = _init_gaze_backend(args.features)
+    calibrator, gaze_extractor = _init_gaze_backend()
 
     backend = MediaPipeLandmarkBackend()
     pose_estimator = HeadPoseEstimator()
-    smoother = GazePointSmoother()
+    smoother = GazePointSmoother(
+        process_var=args.smoothing_process_var,
+        measurement_var=args.smoothing_measurement_var,
+        ema_alpha=args.smoothing_ema_alpha,
+    )
     attention_gate = AttentionGate()
     window_provider = get_window_bounds_provider()
     injector = get_scroll_injector()
@@ -230,16 +247,12 @@ def main() -> None:
                 status_lines.append("PAUSED (looking away)")
                 smoother.reset()
                 trigger.reset_dwell()
-            elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px):
+            elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px, min_ear=args.blink_min_ear):
                 status_lines.append("blink...")
                 trigger.reset_dwell()
             elif points_px is not None and head_pose is not None and (
                 gaze_vector := gaze_extractor.extract(frame, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), points_px)
             ) is None:
-                # e.g. l2cs: landmarks + head pose were fine but the face
-                # crop for this frame wasn't usable -- skip this tick rather
-                # than predict from a missing gaze vector. (handcrafted's
-                # extractor never returns None, so this never fires for it.)
                 status_lines.append("gaze vector unavailable this frame...")
                 trigger.reset_dwell()
             elif points_px is not None and head_pose is not None:
@@ -248,11 +261,10 @@ def main() -> None:
                     (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
                     tuple(head_pose.translation_vector.flatten()),
                 )
-                # Temporary diagnostic for the l2cs "stuck at the edge" bug --
-                # shows the raw leading gaze-vector (yaw/pitch in radians for
-                # l2cs; eye-in-head offset for handcrafted) plus head pose, so
-                # we can see whether the live feature is actually tracking
-                # where you're looking before blaming the fitted model.
+                # Diagnostic: shows the raw leading gaze-vector (eye-in-head
+                # offset) plus head pose, so we can see whether the live
+                # feature is actually tracking where you're looking before
+                # blaming the fitted model.
                 status_lines.append(
                     "feat gaze=(" + ",".join(f"{v:.3f}" for v in gaze_vector) + ") "
                     f"head=({head_pose.yaw_deg:.1f},{head_pose.pitch_deg:.1f},{head_pose.roll_deg:.1f})"

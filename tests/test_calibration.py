@@ -24,8 +24,6 @@ from doomscroll.gaze.calibration import (
     FEATURE_DIM,
     GazeCalibrator,
     build_feature_vector,
-    load_profile_for_backend,
-    profile_path_for_backend,
 )
 from tests.synthetic_calibration import (
     generate_protocol_comparison_session,
@@ -75,8 +73,8 @@ def test_selected_alpha_before_fit_raises():
 
 
 def test_validate_before_fit_raises():
-    """validate() now delegates to predict() per sample (so local
-    correction applies during validation too), so it raises the same clear
+    """validate() delegates to predict() per sample (so local correction
+    applies during validation too), so it raises the same clear
     RuntimeError as predict()/selected_alpha rather than leaking sklearn's
     internal NotFittedError."""
     calibrator = GazeCalibrator()
@@ -157,8 +155,8 @@ def test_local_correction_reduces_error_on_the_nonlinear_synthetic_benchmark():
     docstring on _NONLINEARITY_COEF) -- exactly the regime the local KNN
     residual correction exists for. Comparing against
     local_correction_max_weight=0.0 (which makes _local_correction always
-    return zero, i.e. the old pre-local-correction behavior) isolates its
-    effect from everything else GazeCalibrator does."""
+    return zero) isolates its effect from everything else GazeCalibrator
+    does."""
     sess = generate_synthetic_session(seed=0)
 
     baseline = GazeCalibrator(local_correction_max_weight=0.0)
@@ -237,106 +235,6 @@ def test_pursuit_session_fits_and_validates_without_error():
         f"Pursuit-protocol synthetic benchmark regressed: {mean_error_px:.1f}px, "
         f"expected < {MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX}px."
     )
-
-
-def test_save_load_round_trip_preserves_feature_backend(tmp_path: Path):
-    sess = generate_synthetic_session(seed=1)
-    calibrator = GazeCalibrator(feature_backend="l2cs")
-    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-
-    profile_path = tmp_path / "profile.joblib"
-    calibrator.save(profile_path)
-
-    loaded = GazeCalibrator.load(profile_path)
-    assert loaded.feature_backend == "l2cs"
-
-
-def test_default_feature_backend_is_handcrafted():
-    assert GazeCalibrator().feature_backend == "handcrafted"
-
-
-def test_load_defaults_feature_backend_for_old_style_saved_profile(tmp_path: Path):
-    """A profile saved before feature_backend existed has no such key in
-    its joblib dump at all -- load() must still succeed, defaulting to
-    "handcrafted" (the only backend that existed at the time), rather than
-    raising a KeyError."""
-    sess = generate_synthetic_session(seed=1)
-    calibrator = GazeCalibrator()
-    calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-
-    profile_path = tmp_path / "profile.joblib"
-    calibrator.save(profile_path)
-
-    import joblib
-
-    data = joblib.load(profile_path)
-    del data["feature_backend"]
-    joblib.dump(data, profile_path)
-
-    loaded = GazeCalibrator.load(profile_path)
-    assert loaded.feature_backend == "handcrafted"
-
-
-def test_profile_path_for_backend_is_distinct_per_backend(tmp_path: Path):
-    handcrafted_path = profile_path_for_backend("handcrafted", tmp_path)
-    l2cs_path = profile_path_for_backend("l2cs", tmp_path)
-    assert handcrafted_path != l2cs_path
-    assert handcrafted_path.parent == tmp_path == l2cs_path.parent
-
-
-def test_load_profile_for_backend_round_trips_without_cross_backend_overwrite(tmp_path: Path):
-    """The bug this whole helper exists to fix: calibrating handcrafted
-    then l2cs (or vice versa) must leave BOTH profiles loadable
-    afterward, neither clobbered by the other -- unlike the old shared
-    DEFAULT_PROFILE_PATH, which only ever held whichever backend was
-    calibrated most recently."""
-    sess = generate_synthetic_session(seed=1)
-
-    handcrafted = GazeCalibrator(feature_backend="handcrafted")
-    handcrafted.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-    handcrafted.save(profile_path_for_backend("handcrafted", tmp_path))
-
-    l2cs = GazeCalibrator(feature_backend="l2cs")
-    l2cs.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-    l2cs.save(profile_path_for_backend("l2cs", tmp_path))
-
-    loaded_handcrafted = load_profile_for_backend("handcrafted", tmp_path)
-    loaded_l2cs = load_profile_for_backend("l2cs", tmp_path)
-    assert loaded_handcrafted.feature_backend == "handcrafted"
-    assert loaded_l2cs.feature_backend == "l2cs"
-
-
-def test_load_profile_for_backend_raises_clearly_when_nothing_saved(tmp_path: Path):
-    with pytest.raises(FileNotFoundError, match="calibrate.py --features l2cs"):
-        load_profile_for_backend("l2cs", tmp_path)
-
-
-def test_load_profile_for_backend_falls_back_to_matching_legacy_profile(tmp_path: Path):
-    """An install from before per-backend paths existed has everything in
-    the single legacy default.joblib. load_profile_for_backend() should
-    still find it, as long as its own stored tag matches what's asked
-    for -- so existing users aren't forced to recalibrate just because
-    this helper was introduced."""
-    sess = generate_synthetic_session(seed=1)
-    legacy = GazeCalibrator(feature_backend="l2cs")
-    legacy.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-    legacy.save(tmp_path / "default.joblib")
-
-    loaded = load_profile_for_backend("l2cs", tmp_path)
-    assert loaded.feature_backend == "l2cs"
-
-
-def test_load_profile_for_backend_never_falls_back_to_mismatched_legacy_profile(tmp_path: Path):
-    """The legacy fallback must not resurrect the overwrite bug: a legacy
-    default.joblib tagged 'l2cs' must never be silently handed back for a
-    'handcrafted' request just because it's the only file sitting there."""
-    sess = generate_synthetic_session(seed=1)
-    legacy = GazeCalibrator(feature_backend="l2cs")
-    legacy.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
-    legacy.save(tmp_path / "default.joblib")
-
-    with pytest.raises(FileNotFoundError):
-        load_profile_for_backend("handcrafted", tmp_path)
 
 
 def test_protocol_comparison_session_shapes_are_consistent():

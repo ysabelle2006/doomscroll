@@ -26,7 +26,9 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
         if not _QUARTZ_AVAILABLE:
             raise RuntimeError(
                 "pyobjc-framework-Quartz and pyobjc-framework-Cocoa are required "
-                "on macOS. Install the 'macos' extra: pip install .[macos]"
+                "on macOS -- both are base dependencies there, so `uv sync` / "
+                "`pip install -e .` should already have installed them; try "
+                "re-running that."
             )
 
     def get_focused_window_bounds(self) -> WindowBounds | None:
@@ -45,11 +47,6 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
             # Report "no focused window" instead, so callers fall back to
             # whatever external window was last genuinely focused.
             #
-            # (This used to be guarded by comparing a window *title*
-            # against kCGWindowOwnerName below, which is actually the
-            # owning *application's* name, e.g. "Python" -- never a
-            # window title -- so that comparison could never match and
-            # this case was never actually caught.)
             return None
 
         window_list = CGWindowListCopyWindowInfo(

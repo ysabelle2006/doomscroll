@@ -3,7 +3,7 @@ dependency -- it handles Retina/scaled-display capture correctly on its
 own) feeding into the Vision framework (VNRecognizeTextRequest, via
 pyobjc-framework-Vision) for OCR.
 
-Not exercised on the Linux dev machine this was written on -- pyobjc/Vision
+Not exercised on the Linux dev machine -- pyobjc/Vision
 aren't installable there at all, so unlike windowing/scroll's macOS
 backends (which at least import-guard cleanly), this one has had zero
 real execution before reaching macOS. Treat the exact Vision API surface
@@ -70,7 +70,9 @@ class MacOSVisionContentScanner(ContentScanner):
         if not _VISION_AVAILABLE:
             raise RuntimeError(
                 "pyobjc-framework-Vision (and mss) are required on macOS for "
-                "content-aware scrolling. Install the 'macos' extra: pip install .[macos]"
+                "content-aware scrolling -- pyobjc-framework-Vision is a base "
+                "dependency there, so `uv sync` / `pip install -e .` should "
+                "already have installed it; try re-running that."
             )
         self._sct = mss.mss()
 

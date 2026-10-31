@@ -1,7 +1,6 @@
 """A live, click-through, transparent screen overlay (macOS-only) that
 draws the OCR boxes + current gaze dot directly on top of the real
-content you're reading, updating every tick -- instead of a separate
-window showing a static screenshot, which is what this replaced.
+content you're reading, updating every tick.
 
 Deliberately excluded from feeding back into the pipeline it's debugging,
 two different ways:
@@ -21,7 +20,7 @@ two different ways:
     can never get mistaken for the window you're actually looking at,
     the way a clickable debug window could.
 
-Not exercised on the Linux dev machine this was written on -- same
+Not exercised on the Linux dev machine -- same
 caveat as this project's other macOS-only backends (content/macos_backend.py,
 windowing/macos_backend.py): the AppKit API surface here (NSWindow/NSView
 construction by hand, window levels, the sharing-type exclusion, the
@@ -154,7 +153,9 @@ class ScreenOverlay:
         if not _OVERLAY_AVAILABLE:
             raise RuntimeError(
                 "pyobjc-framework-Cocoa is required on macOS for the live content "
-                "overlay. Install the 'macos' extra: pip install .[macos]"
+                "overlay -- it's a base dependency there, so `uv sync` / "
+                "`pip install -e .` should already have installed it; try "
+                "re-running that."
             )
         self._window: NSWindow | None = None
         self._view: "_OverlayView | None" = None

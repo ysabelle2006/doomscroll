@@ -1,9 +1,11 @@
 """Off-screen / turned-away pause gate.
 
-Deliberately a coarser, higher threshold than gaze/smoothing.py's deadband,
-so ordinary reading head movement never approaches it while an actual
-"user got up / turned away" event reliably does. A short grace period
-avoids pausing on a single missed-detection frame or a quick glance aside.
+Deliberately a coarse, high head-pose-angle threshold (not a measure of
+gaze-position jitter, which gaze/smoothing.py's Kalman filter already
+handles separately), so ordinary reading head movement never approaches
+it while an actual "user got up / turned away" event reliably does. A
+short grace period avoids pausing on a single missed-detection frame or a
+quick glance aside.
 """
 from __future__ import annotations
 

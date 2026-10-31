@@ -29,8 +29,9 @@ class MacOSScrollInjector(ScrollInjector):
     def __init__(self):
         if not _QUARTZ_AVAILABLE:
             raise RuntimeError(
-                "pyobjc-framework-Quartz is required on macOS. "
-                "Install the 'macos' extra: pip install .[macos]"
+                "pyobjc-framework-Quartz is required on macOS -- it's a base "
+                "dependency there, so `uv sync` / `pip install -e .` should "
+                "already have installed it; try re-running that."
             )
 
     def scroll(

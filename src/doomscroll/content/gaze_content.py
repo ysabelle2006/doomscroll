@@ -5,8 +5,8 @@ and then moved past it (has_reached_end), and is there any unseen content
 still ahead of gaze within the viewport (should_scroll).
 
 Hit-testing and dwell-tracking are deliberately tolerant of noise, not
-exact, because this project's real calibration accuracy (historically
-~86-180px mean error in validation runs) is large relative to a typical
+exact, because this project's real calibration accuracy (~86-180px mean
+error in validation runs) is large relative to a typical
 OCR text-line block's height (~15-30px): a gaze point that's "really"
 inside a block will often be reported a bit outside it -- in the gap
 between lines, or briefly on/off a neighboring block for a single noisy
@@ -58,11 +58,11 @@ RESCAN_INTERVAL_S = 0.4
 # derived from anything -- a round number chosen to make a full-width
 # paragraph line take meaningfully longer than a short one, tune freely.
 SEEN_DWELL_MIN_MS = 150  # floor -- applies even to a very narrow block
-SEEN_DWELL_MS_PER_PX = 0.8  # extra required dwell per pixel of the block's own width
+SEEN_DWELL_MS_PER_PX = 0.5  # extra required dwell per pixel of the block's own width
 SEEN_DWELL_MAX_MS = 1500  # cap, so an unusually wide block doesn't require an unreasonable wait
 END_OF_CONTENT_MARGIN_PX = 20  # how far past the lowest block's bottom edge gaze must sit
 HIT_TEST_MAX_DISTANCE_PX = 35  # how far outside a block's own rect still counts as "on" it
-GAP_GRACE_MS = 150  # how long a divergence from the current block must persist before it resets dwell
+GAP_GRACE_MS = 500  # how long a divergence from the current block must persist before it resets dwell
 
 
 def _block_id(block: ContentBlock) -> str:

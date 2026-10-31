@@ -40,7 +40,7 @@ SAMPLES_PER_POINT = 15
 # Ground-truth generative model, in the same [mean_x, mean_y, diff_x,
 # diff_y, yaw, pitch, roll, tx, ty, tz] feature layout build_feature_vector
 # produces. mean_offset (the eye-in-head signal) is the dominant driver, by
-# construction -- matching calibration.py's own description of it as "the
+# construction -- matching gaze_vector.py's own description of it as "the
 # robust, well-conditioned conjugate signal" -- with small, realistic
 # secondary contributions from head pose and eye asymmetry, the same way
 # real head motion legitimately perturbs the true mapping a little.

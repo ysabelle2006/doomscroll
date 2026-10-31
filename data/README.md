@@ -1,9 +1,11 @@
 # Gaze-tracking ML data
 
-Recorded sessions for the calibration-free gaze-tracking experiments (see
-`ml/` at the project root). Each session is one person doing one ~5-minute
-recording while a cursor moves around the screen and they follow it with
-their eyes -- the cursor's logged position is the ground-truth gaze target.
+Recorded sessions for gaze-tracking model experiments, separate from the
+deployed app's own calibration pipeline in `src/doomscroll/gaze/`. Each
+session is one person doing a recording (session lengths vary, typically a
+few minutes, up to 5) while a cursor moves around the screen and they
+follow it with their eyes -- the cursor's logged position is the
+ground-truth gaze target.
 
 ## Layout
 
@@ -11,29 +13,22 @@ their eyes -- the cursor's logged position is the ground-truth gaze target.
 data/raw/<participant>/<session_id>/
     meta.json              # session metadata (see below)
     frames.csv             # raw per-frame cursor log, synced to the webcam recording
-    <session_id>.mp4       # webcam recording (not yet present for most sessions below)
-    <session_id>.npz       # optional: pre-extracted feature vectors (see below)
+    webcam.mp4             # webcam recording
+    <session_id>.npz       # pre-extracted feature vectors (see below)
 ```
 
-Not every session folder currently has every file -- the two samples
-checked in so far (`ysabelle_20261026_135832` and `ysabelle_20261026_132332`)
-are from two *different* recordings, included just to document the format:
-the first has `meta.json` + `frames.csv` (no video or extracted features
-yet), the second has only the pre-extracted `.npz` (no meta.json, csv, or
-video for that one). A complete session folder should eventually have all
-four files once the full dataset is downloaded from Google Drive -- same
-`data/raw/<participant>/<session_id>/` convention, so whatever extraction
-tooling follows doesn't need to change.
+Every session folder currently on disk has the full set of four files
+above (41 sessions across 4 participants, as of this writing).
 
-Across the full dataset (4 participants so far, ~1 hour combined), expect
+Across the full dataset (4 participants so far, ~2 hours combined), expect
 multiple sessions per participant, each recorded with a different head
 position/distance relative to the screen (see `meta.json`'s `notes` field,
-e.g. `"headright"`) -- that positional diversity is what the models in
-`ml/` are meant to learn to be robust to, so don't discard or merge it away
-when splitting data for training/evaluation. A fair test of "does this
-generalize across position shifts" means holding out whole sessions (by
-`notes`) or whole participants from training, not a random frame-level
-split.
+e.g. `"headright"`) -- that positional diversity is what any gaze-tracking
+model trained on this data needs to be robust to, so don't discard or merge
+it away when splitting data for training/evaluation. A fair test of "does
+this generalize across position shifts" means holding out whole sessions
+(by `notes`) or whole participants from training, not a random
+frame-level split.
 
 ## `meta.json`
 
@@ -58,8 +53,7 @@ split.
 
 ## `frames.csv`
 
-One row per webcam frame, synced by `frame_idx`/`t_ms` to the (eventual)
-`.mp4`:
+One row per webcam frame, synced by `frame_idx`/`t_ms` to `webcam.mp4`:
 
 ```
 frame_idx,t_ms,cursor_x,cursor_y,mouse_down,active

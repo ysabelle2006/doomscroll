@@ -12,19 +12,18 @@ dependencies = [
     "pydantic>=2",
     "platformdirs",
     "loguru",
+    # macOS-only backends (scroll/windowing injection, Vision-based OCR content
+    # scanner) -- gated by the sys_platform marker so a plain `uv sync` /
+    # `pip install .` on macOS just works, with no separate --extra needed;
+    # the marker makes these a no-op on Windows/Linux, same as never listing
+    # them there at all.
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
 windows = ["pywin32"]
-macos = ["pyobjc-framework-Quartz", "pyobjc-framework-Cocoa", "pyobjc-framework-Vision"]
-# Needed only for scripts/calibrate.py and scripts/phase2_gaze_scroll.py's
-# `--features l2cs` flag (src/doomscroll/gaze/l2cs_backend.py) -- the default
-# `--features handcrafted` needs none of this. Same pins as the `ml` dev
-# group below (used by offline research/comparison scripts outside this
-# repo); duplicated here as a real install extra, not a dev group, because
-# this one is meant for end users who want the live app to use it, via
-# `uv sync --extra l2cs` / `pip install .[l2cs]`.
-l2cs = ["safetensors>=0.8.0", "torch>=2.14.1", "torchvision>=0.29.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -34,11 +33,6 @@ package = false
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
-ml = [
-    "safetensors>=0.8.0",
-    "torch>=2.14.1",
-    "torchvision>=0.29.1",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

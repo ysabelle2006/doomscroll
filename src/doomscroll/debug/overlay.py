@@ -1,10 +1,10 @@
 """Small reusable debug-overlay drawing helpers, used by the live validation
-scripts and extended in later phases (content region boxes, FSM state).
+scripts.
 
 The OCR-boxes-plus-gaze-dot view lives in screen_overlay.py instead of
 here, as a live, click-through, transparent window drawn directly over
 the real content -- rather than a cv2 window drawn onto a captured
-screenshot, which is what used to be here."""
+screenshot."""
 from __future__ import annotations
 
 import cv2
