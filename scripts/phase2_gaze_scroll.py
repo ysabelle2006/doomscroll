@@ -29,7 +29,16 @@ focused-window detection (see that module's docstring for how/why), so
 it can't confuse either one. If pyobjc's Cocoa isn't available, the
 overlay is silently skipped -- everything else still runs.
 
-Run scripts/calibrate.py first. Then:
+--model (default: math) picks which calibrated pipeline predicts the
+gaze point: 'math' loads the GazeCalibrator profile scripts/calibrate.py
+saves by default; 'cnn' instead loads the CNN trained offline on
+data_raw (scripts/train_cnn.py) plus whatever per-user AffineCorrection
+scripts/calibrate.py --model cnn has saved for it (see
+gaze/cnn_calibration.py) -- uncorrected if calibrate.py --model cnn
+hasn't been run yet.
+
+Run scripts/calibrate.py first (--model math or --model cnn, matching
+whichever --model you pass here). Then:
   .venv\\Scripts\\python.exe scripts\\phase2_gaze_scroll.py
 Press 'q' to quit.
 """
@@ -54,7 +63,9 @@ from doomscroll.fixation.attention_gate import AttentionGate
 from doomscroll.fixation.mapper import to_window_relative_fraction
 from doomscroll.fixation.scroll_trigger import ScrollTrigger, ScrollTriggerConfig
 from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
+from doomscroll.gaze.cnn_calibration import DEFAULT_CNN_PATH
 from doomscroll.gaze.feature_backend import GazeVectorExtractor, make_gaze_extractor
+from doomscroll.ml.model import load_gaze_model
 from doomscroll.gaze.gaze_vector import DEFAULT_MIN_EYE_ASPECT_RATIO, is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator
 from doomscroll.gaze.smoothing import GazePointSmoother
@@ -96,8 +107,30 @@ def _init_gaze_backend() -> tuple[GazeCalibrator, GazeVectorExtractor]:
     return calibrator, gaze_extractor
 
 
+def _init_cnn_backend():
+    """--model cnn: the CNN trained offline by scripts/train_cnn.py, with
+    whatever per-user AffineCorrection scripts/calibrate.py --model cnn
+    has saved for it already applied (see gaze/cnn_calibration.py) --
+    uncorrected if that hasn't been run yet, same as the math pipeline
+    running without having calibrated."""
+    try:
+        return load_gaze_model(DEFAULT_CNN_PATH, with_correction=True)
+    except FileNotFoundError as e:
+        print(e)
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 2: calibrated gaze mapping + content-aware scroll trigger")
+    parser.add_argument(
+        "--model",
+        choices=["math", "cnn"],
+        default="math",
+        help="Which calibrated pipeline predicts the gaze point (default: math) -- 'math' loads "
+        "the GazeCalibrator profile scripts/calibrate.py saves by default; 'cnn' loads the CNN "
+        "trained offline on data_raw plus whatever per-user correction scripts/calibrate.py "
+        "--model cnn has saved for it (see gaze/cnn_calibration.py).",
+    )
     parser.add_argument(
         "--content-only",
         action="store_true",
@@ -158,7 +191,12 @@ def main() -> None:
     clamp_x = (-EXTRAPOLATION_MARGIN * screen_w, (1 + EXTRAPOLATION_MARGIN) * screen_w)
     clamp_y = (-EXTRAPOLATION_MARGIN * screen_h, (1 + EXTRAPOLATION_MARGIN) * screen_h)
 
-    calibrator, gaze_extractor = _init_gaze_backend()
+    cnn_model = None
+    calibrator = gaze_extractor = None
+    if args.model == "cnn":
+        cnn_model = _init_cnn_backend()
+    else:
+        calibrator, gaze_extractor = _init_gaze_backend()
 
     backend = MediaPipeLandmarkBackend()
     pose_estimator = HeadPoseEstimator()
@@ -250,26 +288,31 @@ def main() -> None:
             elif points_px is not None and head_pose is not None and not is_gaze_usable(points_px, min_ear=args.blink_min_ear):
                 status_lines.append("blink...")
                 trigger.reset_dwell()
-            elif points_px is not None and head_pose is not None and (
+            elif points_px is not None and head_pose is not None and args.model == "math" and (
                 gaze_vector := gaze_extractor.extract(frame, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), points_px)
             ) is None:
                 status_lines.append("gaze vector unavailable this frame...")
                 trigger.reset_dwell()
             elif points_px is not None and head_pose is not None:
-                feature = build_feature_vector(
-                    gaze_vector,
-                    (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
-                    tuple(head_pose.translation_vector.flatten()),
-                )
-                # Diagnostic: shows the raw leading gaze-vector (eye-in-head
-                # offset) plus head pose, so we can see whether the live
-                # feature is actually tracking where you're looking before
-                # blaming the fitted model.
-                status_lines.append(
-                    "feat gaze=(" + ",".join(f"{v:.3f}" for v in gaze_vector) + ") "
-                    f"head=({head_pose.yaw_deg:.1f},{head_pose.pitch_deg:.1f},{head_pose.roll_deg:.1f})"
-                )
-                raw_point = calibrator.predict(feature)
+                if args.model == "cnn":
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    raw_point = cnn_model.predict_px(points_px, head_pose, gray, (screen_w, screen_h))
+                    status_lines.append(f"cnn pred=({raw_point[0]:.0f},{raw_point[1]:.0f})")
+                else:
+                    feature = build_feature_vector(
+                        gaze_vector,
+                        (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
+                        tuple(head_pose.translation_vector.flatten()),
+                    )
+                    # Diagnostic: shows the raw leading gaze-vector (eye-in-head
+                    # offset) plus head pose, so we can see whether the live
+                    # feature is actually tracking where you're looking before
+                    # blaming the fitted model.
+                    status_lines.append(
+                        "feat gaze=(" + ",".join(f"{v:.3f}" for v in gaze_vector) + ") "
+                        f"head=({head_pose.yaw_deg:.1f},{head_pose.pitch_deg:.1f},{head_pose.roll_deg:.1f})"
+                    )
+                    raw_point = calibrator.predict(feature)
                 clamped_point = np.array(
                     [np.clip(raw_point[0], *clamp_x), np.clip(raw_point[1], *clamp_y)]
                 )

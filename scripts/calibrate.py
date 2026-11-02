@@ -1,7 +1,8 @@
 """Phase 2: gaze calibration, plus a head-pose variation pass.
 
 Two calibration PROTOCOLS coexist, selected by --protocol (see main() and
-the "Protocol dispatch" section):
+the "Protocol dispatch" section). Independently, --model picks what the
+capture is actually fitted to (see "Model dispatch" below --protocol dots):
 
   - --protocol dots uses the point-by-point dot-grid protocol
     (run_sequence()/collect_samples_for_point()): you look at each dot in
@@ -64,6 +65,21 @@ sweep (see _short_trajectory_waypoints()) per variant -- see the shared
 A validation pass follows afterward too, using the same short anchor-free
 raster, reporting mean pixel error.
 
+--- Model dispatch (--model) ---
+
+  - --model math (default) fits a GazeCalibrator (RidgeCV on the
+    handcrafted feature vector) directly on the captured session -- the
+    behavior described above and throughout this docstring.
+  - --model cnn instead fits a per-user AffineCorrection on top of a CNN
+    trained offline on data_raw (scripts/train_cnn.py, never during
+    calibration -- see gaze/cnn_calibration.py) by recording that
+    pretrained model's own prediction for each captured frame instead of
+    a handcrafted feature vector. Always uses the trajectory protocol
+    (--protocol is ignored for --model cnn), since that's the capture
+    mechanic this pipeline is paired with; the capture itself -- dot
+    path, head-pose variation pass, validation -- is identical either
+    way, only what gets fitted at the end differs.
+
 --- Head-pose variation pass (shared, both protocols) ---
 
 Immediately after the main pass, you'll be asked to hold your head in a
@@ -100,6 +116,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -109,6 +126,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from doomscroll.capture.webcam import WebcamSource
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.gaze.calibration import DEFAULT_PROFILE_PATH, FEATURE_DIM, GazeCalibrator, build_feature_vector
+from doomscroll.gaze.cnn_calibration import fit_and_save_cnn_correction, load_pretrained_cnn, make_cnn_sample_fn
 from doomscroll.gaze.feature_backend import GazeVectorExtractor, make_gaze_extractor
 from doomscroll.gaze.gaze_vector import is_gaze_usable
 from doomscroll.gaze.head_pose import HeadPoseEstimator, HeadPose
@@ -755,13 +773,14 @@ def run_trajectory_capture(
     pose_estimator: HeadPoseEstimator,
     screen_w: int,
     screen_h: int,
-    gaze_extractor: GazeVectorExtractor,
+    gaze_extractor: GazeVectorExtractor | None = None,
     duration_s: float = TRAJECTORY_DURATION_S,
     lag_ms: float = TRAJECTORY_LAG_MS,
     turn_discard_ms: float = TRAJECTORY_TURN_DISCARD_MS,
     anchor_settle_ms: float = ANCHOR_SETTLE_MS,
     group_offset: int = 0,
     full_path: bool = True,
+    sample_fn: Callable[[np.ndarray, np.ndarray, np.ndarray, HeadPose], np.ndarray | None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Continuously collects (gaze feature, target) samples while a single
     dot sweeps the whole screen on its own programmed path (see
@@ -780,7 +799,15 @@ def run_trajectory_capture(
     the shorter pose-variant and validation passes. build_keyframes()
     paces every segment of either path -- anchor transitions and raster
     segments alike -- at the same constant angular velocity, derived
-    purely from the path's length and duration_s."""
+    purely from the path's length and duration_s.
+
+    sample_fn, when given, is called per usable frame as
+    sample_fn(frame_bgr, frame_gray, points_px, head_pose) and its return
+    value (or None for "no usable sample this frame", same meaning as a
+    failed gaze_vector extraction) is recorded in place of the
+    gaze_extractor-based handcrafted feature vector; gaze_extractor is
+    then ignored. See gaze/cnn_calibration.py's make_cnn_sample_fn() for
+    the --model cnn pipeline's use of this."""
     if full_path:
         path_fracs = build_waypoints()
         keyframes = build_keyframes(total_duration_ms=duration_s * 1000.0)
@@ -851,17 +878,20 @@ def run_trajectory_capture(
             pose_rejected += 1
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gaze_vector = gaze_extractor.extract(frame, gray, points_px)
-        if gaze_vector is None:
+        if sample_fn is not None:
+            sample = sample_fn(frame, gray, points_px, head_pose)
+        else:
+            gaze_vector = gaze_extractor.extract(frame, gray, points_px)
+            sample = None if gaze_vector is None else build_feature_vector(
+                gaze_vector,
+                (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
+                tuple(head_pose.translation_vector.flatten()),
+            )
+        if sample is None:
             no_face += 1
             continue
-        feature = build_feature_vector(
-            gaze_vector,
-            (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg),
-            tuple(head_pose.translation_vector.flatten()),
-        )
         capture_t_ms.append(now_ms)
-        features.append(feature)
+        features.append(sample)
 
     print(
         f"    ({no_face} no-face, {blink_rejected} blink, {pose_rejected} pose-reject frames "
@@ -869,7 +899,8 @@ def run_trajectory_capture(
     )
 
     if not features:
-        return np.empty((0, FEATURE_DIM)), np.empty((0, 2)), np.empty((0,), dtype=int)
+        empty_dim = 2 if sample_fn is not None else FEATURE_DIM
+        return np.empty((0, empty_dim)), np.empty((0, 2)), np.empty((0,), dtype=int)
 
     capture_t_ms_arr = np.array(capture_t_ms, dtype=np.float64)
     features_arr = np.array(features)
@@ -1004,14 +1035,18 @@ def _run_trajectory_training(
     pose_estimator: HeadPoseEstimator,
     screen_w: int,
     screen_h: int,
-    gaze_extractor: GazeVectorExtractor,
+    gaze_extractor: GazeVectorExtractor | None = None,
     lag_ms: float = TRAJECTORY_LAG_MS,
+    sample_fn: Callable[[np.ndarray, np.ndarray, np.ndarray, HeadPose], np.ndarray | None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """gaze_extractor and sample_fn are forwarded as-is to
+    run_trajectory_capture() -- see its docstring; sample_fn, when given,
+    takes over what gets recorded per frame and gaze_extractor is ignored."""
     wait_for_front_ready(cam, backend, pose_estimator, screen_w, screen_h)
     print(f"Main pass: a dot will sweep the whole screen on its own for ~{TRAJECTORY_DURATION_S:.0f}s -- keep your head still, just follow it with your eyes.")
     all_features, all_targets, all_groups = run_trajectory_capture(
         cam, backend, pose_estimator, screen_w, screen_h, gaze_extractor,
-        duration_s=TRAJECTORY_DURATION_S, lag_ms=lag_ms,
+        duration_s=TRAJECTORY_DURATION_S, lag_ms=lag_ms, sample_fn=sample_fn,
     )
     next_group_id = _next_group_id(0, all_groups)
 
@@ -1024,7 +1059,7 @@ def _run_trajectory_training(
         features, targets, groups = run_trajectory_capture(
             cam, backend, pose_estimator, screen_w, screen_h, gaze_extractor,
             duration_s=TRAJECTORY_POSE_VARIANT_DURATION_S, group_offset=next_group_id, full_path=False,
-            lag_ms=lag_ms,
+            lag_ms=lag_ms, sample_fn=sample_fn,
         )
         next_group_id = _next_group_id(next_group_id, groups)
         if features.shape[0] == 0:
@@ -1047,9 +1082,10 @@ def _run_trajectory_validation(
     pose_estimator: HeadPoseEstimator,
     screen_w: int,
     screen_h: int,
-    gaze_extractor: GazeVectorExtractor,
-    next_group_id: int,
+    gaze_extractor: GazeVectorExtractor | None = None,
+    next_group_id: int = 0,
     lag_ms: float = TRAJECTORY_LAG_MS,
+    sample_fn: Callable[[np.ndarray, np.ndarray, np.ndarray, HeadPose], np.ndarray | None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     wait_for_front_ready(
         cam,
@@ -1062,9 +1098,63 @@ def _run_trajectory_validation(
     val_features, val_targets, _val_groups = run_trajectory_capture(
         cam, backend, pose_estimator, screen_w, screen_h, gaze_extractor,
         duration_s=TRAJECTORY_VALIDATION_DURATION_S, group_offset=next_group_id, full_path=False,
-        lag_ms=lag_ms,
+        lag_ms=lag_ms, sample_fn=sample_fn,
     )
     return val_features, val_targets
+
+
+def _run_cnn_calibration(
+    cam: WebcamSource,
+    backend: MediaPipeLandmarkBackend,
+    pose_estimator: HeadPoseEstimator,
+    screen_w: int,
+    screen_h: int,
+    lag_ms: float = TRAJECTORY_LAG_MS,
+) -> None:
+    """--model cnn: the same trajectory dot-sweep capture as the math
+    pipeline (_run_trajectory_training()/_run_trajectory_validation()),
+    but recording the pretrained CNN's own raw prediction per frame
+    instead of a handcrafted feature vector (gaze/cnn_calibration.py's
+    make_cnn_sample_fn()), then fitting a per-user AffineCorrection on top
+    of those predictions instead of a GazeCalibrator. The CNN itself is
+    never trained here -- see docs/ML_PIPELINE.md's CNN section for
+    training it from data_raw."""
+    cnn_model = load_pretrained_cnn()
+    sample_fn = make_cnn_sample_fn(cnn_model)
+
+    preds, targets, groups = _run_trajectory_training(
+        cam, backend, pose_estimator, screen_w, screen_h, lag_ms=lag_ms, sample_fn=sample_fn,
+    )
+    if len(preds) == 0:
+        print("\nNo usable samples captured -- nothing to calibrate.")
+        return
+    next_group_id = _next_group_id(0, groups)
+    val_preds, val_targets = _run_trajectory_validation(
+        cam, backend, pose_estimator, screen_w, screen_h, next_group_id=next_group_id,
+        lag_ms=lag_ms, sample_fn=sample_fn,
+    )
+
+    screen_diag = (screen_w**2 + screen_h**2) ** 0.5
+    print(f"\nFitted on {len(preds)} samples.")
+    correction, before_px, after_px, used_fit, saved_path = fit_and_save_cnn_correction(
+        preds, targets, (screen_w, screen_h)
+    )
+    print(
+        f"Per-user correction, leave-one-out: {before_px:.1f}px -> {after_px:.1f}px "
+        f"({100 * before_px / screen_diag:.1f}% -> {100 * after_px / screen_diag:.1f}% of screen diagonal)."
+    )
+    if not used_fit:
+        print("Correction didn't improve on the CNN's raw predictions -- saved an identity correction instead.")
+
+    if len(val_preds) > 0:
+        wh = np.array([screen_w, screen_h], dtype=np.float64)
+        val_corrected_px = np.array([correction.apply(p) for p in val_preds]) * wh
+        val_err = float(np.linalg.norm(val_corrected_px - val_targets, axis=1).mean())
+        print(f"Held-out validation mean error: {val_err:.1f}px ({100 * val_err / screen_diag:.1f}% of screen diagonal).")
+    else:
+        print("\nNo validation samples captured (face not detected during validation).")
+
+    print(f"Per-user CNN correction saved to {saved_path}.")
 
 
 def main() -> None:
@@ -1099,6 +1189,16 @@ def main() -> None:
         "4x4 dot-grid protocol (run_sequence()/collect_samples_for_point()).",
     )
     parser.add_argument(
+        "--model",
+        choices=["math", "cnn"],
+        default="math",
+        help="What the capture is fitted to (default: math) -- 'math' fits a GazeCalibrator "
+        "(RidgeCV on the handcrafted feature vector) directly on this session, same as always. "
+        "'cnn' instead fits a per-user AffineCorrection on top of a CNN trained offline on "
+        "data_raw (scripts/train_cnn.py; see gaze/cnn_calibration.py), and always uses the "
+        "trajectory protocol regardless of --protocol.",
+    )
+    parser.add_argument(
         "--lag-ms",
         type=float,
         default=TRAJECTORY_LAG_MS,
@@ -1129,6 +1229,10 @@ def main() -> None:
 
     if args.poly_degree is None:
         args.poly_degree = 2 if args.protocol == "trajectory" else 1
+
+    if args.model == "cnn" and args.protocol != "trajectory":
+        print("--model cnn always uses the trajectory protocol; ignoring --protocol dots.")
+        args.protocol = "trajectory"
 
     if args.clear_history:
         removed = clear_sessions()
@@ -1165,6 +1269,10 @@ def main() -> None:
     try:
         with WebcamSource(0) as cam:
             print("Calibration starting. ESC to abort.")
+
+            if args.model == "cnn":
+                _run_cnn_calibration(cam, backend, pose_estimator, screen_w, screen_h, lag_ms=args.lag_ms)
+                return
 
             # Which capture mechanic actually runs depends on --protocol --
             # see the module docstring and the "Protocol dispatch" section

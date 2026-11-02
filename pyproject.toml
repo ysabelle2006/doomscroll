@@ -8,7 +8,9 @@ dependencies = [
     "mediapipe==0.10.21",
     "numpy",
     "scikit-learn",
+    "joblib",
     "mss",
+    "pynput",  # global cursor position for scripts/record_session.py's data collection
     "pydantic>=2",
     "platformdirs",
     "loguru",
@@ -24,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 windows = ["pywin32"]
+cnn = ["torch>=2.2"]  # only for scripts/train_cnn.py and running the CNN gaze model
 
 [tool.setuptools.packages.find]
 where = ["src"]
