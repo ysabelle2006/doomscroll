@@ -5,8 +5,9 @@ Two honest problems with "cursor position == where the person looks":
 1. LAG. The eyes land on a target ~100-250 ms before the hand gets the cursor
    there, and the camera frame is itself slightly old. So the label for frame
    at time t is best taken from the cursor at t + lag. `lag_ms` is a
-   hyper-parameter: sweep it in train_model.py (--sweep-lag) and keep the one
-   with the lowest held-out error.
+   hyper-parameter: train_model.py sweeps it automatically and keeps the one
+   with the lowest held-out error (stored for the CNN's train_cnn.py to
+   reuse -- see docs/ML_PIPELINE.md).
 
 2. IDLE CURSOR. A cursor sitting still says nothing about where the eyes are
    (the person may be reading elsewhere). We keep only frames where the cursor

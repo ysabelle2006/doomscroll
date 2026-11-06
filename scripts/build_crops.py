@@ -5,9 +5,12 @@
     python scripts/build_crops.py --session data/recordings/anni_20261024_232035
     python scripts/build_crops.py --preview          # also save a contact sheet of crops to eyeball
 
-The CNN version of build_dataset.py (output: data/crops/). Slow, run once;
-skips sessions already built unless --force. Re-run with --force after
-changing ml/eye_crops.py or ml/features.py.
+The CNN version of build_dataset.py (output: datasets/crops/, at the
+project root -- see doomscroll.recording.session's own docstring for why
+that's separate from this file's data/ -- NOT data/crops/, an old
+location that's no longer read by anything). Slow, run once; skips
+sessions already built unless --force. Re-run with --force after changing
+ml/eye_crops.py or ml/features.py.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.ml.crop_dataset import CropSession, build_crop_session
 from doomscroll.ml.features import FrameFeaturizer
-from doomscroll.recording.session import SessionPaths, find_sessions
+from doomscroll.recording.session import CROPS_DIR, SessionPaths, find_sessions
 
 ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -48,7 +51,7 @@ def contact_sheet(cs: CropSession, out: Path, n: int = 24) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recordings", type=Path, default=ROOT / "recordings")
-    ap.add_argument("--out", type=Path, default=ROOT / "crops")
+    ap.add_argument("--out", type=Path, default=CROPS_DIR)
     ap.add_argument("--session", type=Path, action="append", help="build only this session folder (repeatable)")
     ap.add_argument("--stride", type=int, default=1, help="process every n-th frame (default 1 = all)")
     ap.add_argument("--preview", action="store_true", help="save <session>_preview.png next to the .npz")

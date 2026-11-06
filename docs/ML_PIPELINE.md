@@ -3,11 +3,13 @@
 ## The pipeline
 
 ```
-record_session.py      build_dataset.py        train_model.py          phase2_gaze_scroll.py --model math
-webcam + cursor  --->  MediaPipe features ---> compare models, save --> live scrolling
-(per group member)     (one .npz / session)    models/gaze_model.joblib  (+ scripts/calibrate.py --model math)
-data/recordings/       data/datasets/
+record_session.py      build_dataset.py        train_model.py                train_cnn.py
+webcam + cursor  --->  MediaPipe features ---> re-estimate CNN lag_ms   --->  retrain CNN (reads lag_ms)
+(per group member)     (one .npz / session)    models/gaze_model.joblib
+data/recordings/       datasets/features/
 ```
+
+(`datasets/` is a separate top-level folder from `data/` -- see `datasets/README.md`: `data/recordings/` is just raw per-session staging, `datasets/` is the permanent, anonymized archive of what's actually trained on. The math model -- `scripts/calibrate.py` / `phase2_gaze_scroll.py --model math` -- is a completely separate pipeline that never touches any of this; see "Not done / next steps" below.)
 
 | Step | Code | Why it's separate |
 |---|---|---|
@@ -31,8 +33,9 @@ afterwards. Consequences:
   screen frame for a webcam frame use `recording.screen.nearest_index`.
 - It is not needed for training. The cursor log is the label.
 - Residual error = camera latency + the eye arriving before the hand. Handled
-  as ONE number, `lag_ms` (label = cursor at `t + lag`), found with
-  `train_model.py --sweep-lag`.
+  as ONE number, `lag_ms` (label = cursor at `t + lag`), found automatically by
+  `train_model.py` (it always sweeps a handful of candidate lags now, no flag
+  needed) and fed to the CNN's `train_cnn.py`.
 
 > If a teammate already recorded screen/face with separate tools (OBS, QuickTime, ...)
 > those can't be synced as reliably. Re-record with `record_session.py`, or write a
@@ -58,28 +61,46 @@ python scripts/record_session.py --participant nicole --duration 300 --notes "he
 ```
 `data/` is git-ignored on purpose: it's face video. Share it privately, with consent.
 
-## Training and honest evaluation
+## Re-estimating the CNN's cursor-lag
 
 ```bash
 python scripts/build_dataset.py
-python scripts/train_model.py --sweep-lag
+python scripts/train_model.py
 ```
-Candidates are in `CANDIDATES` (`ml/training.py`): `ridge` (stand-in for the old
-linear calibration, i.e. the baseline), `mlp`, `hgb`. Error is measured on
-held-out whole sessions (>= 3 sessions) or 20 s time blocks (fewer). A random
-frame split would leak near-duplicate neighbouring frames and look great but
-mean nothing. The report also prints error per head-yaw range, which is the
-direct evidence for "does head angle still hurt?". For the TA report, show that
-table for `ridge` on the old 7 features vs the new model.
+`train_model.py` doesn't train or compare a standalone predictor anymore -- it
+sweeps a handful of candidate lags (ridge only, as a quick, cheap proxy)
+against whatever's currently in `datasets/features/`, and stores whichever
+lag scored lowest as `lag_ms` in `models/gaze_model.joblib`. `train_cnn.py`'s
+`default_lag()` reads that automatically on its next retrain. `app.py`'s
+"Record, train & calibrate" already runs both of these steps itself (right
+after `build_crops.py`, right before retraining the CNN), so this isn't
+something you'd normally run by hand.
+
+The old multi-candidate comparison (`ridge`/`mlp`/`hgb`, with held-out error
+by head-yaw and by participant) used to live here, for researching the math
+model's own recipe -- it's still in git history if that's ever worth
+revisiting. But `scripts/calibrate.py`'s `GazeCalibrator` (the actual live
+math model -- see "Shorter calibration" below) never loaded anything this
+script produced, so keeping that comparison as a production step was cost
+with no runtime benefit.
 
 ## Shorter calibration
 
-The shared model learns the general mapping; `scripts/calibrate.py --model math`
-(or `--model cnn` for the CNN pipeline below) fits only a per-user scale+shift
-on top of it, using the trajectory dot-sweep capture (see
-gaze/cnn_calibration.py for the CNN case), and only saves the fit if its
-leave-one-out error beats "no correction". Run the app with
-`phase2_gaze_scroll.py --model math` (or `--model cnn`).
+The two prediction pipelines calibrate independently, each with the
+mechanic suited to how it actually works:
+
+- **Math model**: `scripts/calibrate.py` fits a `GazeCalibrator` from
+  scratch every session -- there's no separate pretrained math model to
+  build on, so it needs the longer dot-grid or continuous-trajectory
+  capture (see its own docstring's `--protocol`).
+- **CNN**: `scripts/quick_calibrate.py` instead fits only a tiny
+  per-user scale+shift (`ml/model.py`'s `AffineCorrection`) on top of
+  the CNN already trained offline (see "CNN on eye crops" below) -- a
+  quick 9-dot round (~15s), since the CNN already knows the general
+  mapping and only needs nudging for this person/camera/seat. Only
+  saves the fit if its leave-one-out error beats "no correction".
+
+Run the app with `phase2_gaze_scroll.py --model math` (or `--model cnn`).
 
 ## Changing things safely
 
@@ -95,9 +116,9 @@ Instead of hand-made landmark numbers, a small CNN looks at the eye pixels.
 
 ```bash
 pip install torch                                  # or: uv pip install -e ".[macos,cnn]"
-python scripts/build_crops.py --preview            # MediaPipe once -> data/crops/*.npz (+ crop contact sheets)
+python scripts/build_crops.py --preview            # MediaPipe once -> datasets/crops/*.npz (+ crop contact sheets)
 python scripts/train_cnn.py                        # held-out test vs ridge/hgb on the same frames, then save
-python scripts/calibrate.py --model cnn             # per-user correction, via the trajectory dot-sweep
+python scripts/quick_calibrate.py                   # per-user correction, quick 9-dot round (~15s)
 python scripts/phase2_gaze_scroll.py --model cnn
 ```
 

@@ -6,10 +6,11 @@
     python scripts/train_cnn.py --epochs 40 --train-stride 2
     python scripts/train_cnn.py --cv person         # hold out whole PEOPLE: works on someone new?
 
-Needs crop datasets from scripts/build_crops.py, and torch (pip install torch).
-Prints the CNN's held-out pixel error NEXT TO ridge and hgb trained on the SAME
-frames with the SAME folds, so the comparison is fair. Output: models/gaze_cnn.pt
-(use it with: phase2_gaze_scroll.py --model models/gaze_cnn.pt).
+Needs crop datasets from scripts/build_crops.py (datasets/crops/, at the
+project root -- see doomscroll.recording.session), and torch (pip install
+torch). Prints the CNN's held-out pixel error NEXT TO ridge and hgb trained
+on the SAME frames with the SAME folds, so the comparison is fair. Output:
+models/gaze_cnn.pt (use it with: phase2_gaze_scroll.py --model models/gaze_cnn.pt).
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from doomscroll.ml.crop_dataset import load_all_crops
 from doomscroll.ml.features import FEATURE_NAMES, YAW_INDEX
 from doomscroll.ml.model import DEFAULT_MODEL_PATH
 from doomscroll.ml.training import error_by_group, error_by_yaw
+from doomscroll.recording.session import CROPS_DIR
 
 ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -54,7 +56,7 @@ def print_report(report: dict) -> None:
 
 
 def default_lag() -> float:
-    """Reuse the lag train_model.py --sweep-lag picked, if that model exists."""
+    """Reuse the lag train_model.py's lag sweep picked, if that model exists."""
     try:
         import joblib
 
@@ -65,7 +67,7 @@ def default_lag() -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--crops", type=Path, default=ROOT / "crops")
+    ap.add_argument("--crops", type=Path, default=CROPS_DIR)
     ap.add_argument("--out", type=Path, default=DEFAULT_CNN_PATH)
     ap.add_argument("--lag-ms", type=float, default=None, help="default: the lag stored in models/gaze_model.joblib, else 0")
     ap.add_argument("--window-ms", type=float, default=600.0)

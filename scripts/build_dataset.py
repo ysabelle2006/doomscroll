@@ -3,9 +3,13 @@
     python scripts/build_dataset.py                 # all sessions in data/recordings
     python scripts/build_dataset.py --session data/recordings/nicole_20250101_120000
 
-Slow (every frame goes through MediaPipe); skips sessions already built unless
---force. Re-run with --force after changing doomscroll/ml/features.py.
-Labels (lag, idle filter) are applied later, in train_model.py.
+The math-model counterpart of build_crops.py (output: datasets/features/,
+at the project root -- see doomscroll.recording.session's own docstring
+for why that's separate from this file's data/ -- NOT data/datasets/, an
+old location that's no longer read by anything). Slow (every frame goes
+through MediaPipe); skips sessions already built unless --force. Re-run
+with --force after changing doomscroll/ml/features.py. Labels (lag, idle
+filter) are applied later, in train_model.py.
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.ml.dataset import build_session_dataset
 from doomscroll.ml.features import FrameFeaturizer
-from doomscroll.recording.session import SessionPaths, find_sessions
+from doomscroll.recording.session import FEATURES_DIR, SessionPaths, find_sessions
 
 ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -25,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1] / "data"
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recordings", type=Path, default=ROOT / "recordings")
-    ap.add_argument("--out", type=Path, default=ROOT / "datasets")
+    ap.add_argument("--out", type=Path, default=FEATURES_DIR)
     ap.add_argument("--session", type=Path, action="append", help="build only this session folder (repeatable)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()

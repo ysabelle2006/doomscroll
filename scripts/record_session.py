@@ -16,10 +16,8 @@ Ctrl+C stops early; the partial session is kept.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -29,7 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from doomscroll.capture.webcam import WebcamSource
 from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.recording.recorder import PynputCursor, Recorder
-from doomscroll.recording.session import SessionMeta, SessionPaths
+from doomscroll.recording.session import (
+    CROPS_DIR, FEATURES_DIR, SessionMeta, SessionPaths, get_default_participant, make_session_id,
+    participant_hashid,
+)
 
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "data" / "recordings"
 PREVIEW_WIDTH = 320
@@ -37,7 +38,15 @@ PREVIEW_WIDTH = 320
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--participant", required=True, help="short name, e.g. 'nicole' (used in folder name)")
+    ap.add_argument(
+        "--participant", default=None,
+        help="short name, e.g. 'nicole' -- NOT used in the folder/file name or saved anywhere on disk; "
+        "only its hash is (see doomscroll.recording.session.participant_hashid()). Pass the same name "
+        "again for this same person's later sessions so they keep landing under the same hashid. "
+        "Optional: if omitted (e.g. when called from app.py, which never collects a name), a random "
+        "id generated once for this machine and reused every time (get_default_participant()) is "
+        "hashed instead, so repeat recordings here still land under one consistent hashid.",
+    )
     ap.add_argument("--duration", type=float, default=300.0, help="seconds to record (default 300)")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--screen", action="store_true", help="also record the screen (optional, not needed for training)")
@@ -49,9 +58,17 @@ def main() -> None:
 
     ensure_dpi_aware()  # must precede get_screen_size so cursor and screen size share one coordinate space
     screen_w, screen_h = get_screen_size()
-    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", args.participant)
-    session_id = f"{safe_name}_{datetime.now():%Y%m%d_%H%M%S}"
-    meta = SessionMeta(session_id, args.participant, screen_w, screen_h, camera_index=args.camera, notes=args.notes)
+    # session_id (and therefore every file/folder name touched below) is
+    # <hashid>_<date>_<recordID> -- never the participant's real name; see
+    # doomscroll.recording.session's own docstring. Scanning CROPS_DIR/
+    # FEATURES_DIR too (not just this recording's own --out) is what lets
+    # a brand new recording continue this participant's existing
+    # numbering instead of colliding with sessions already built from
+    # data recorded earlier.
+    participant = args.participant or get_default_participant()
+    session_id = make_session_id(participant, CROPS_DIR, FEATURES_DIR, args.out)
+    hashid = participant_hashid(participant)
+    meta = SessionMeta(session_id, hashid, screen_w, screen_h, camera_index=args.camera, notes=args.notes)
     paths = SessionPaths(args.out / session_id)
 
     last_print = [0.0]

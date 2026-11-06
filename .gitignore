@@ -3,5 +3,5 @@
 **/doomscroll.egg-info
 **/.DS_Store
 **/.pytest_cache
-data/
-models/
+datasets/.participant_map.local.json
+models/gaze_cnn.report.json

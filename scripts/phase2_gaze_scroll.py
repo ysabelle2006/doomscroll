@@ -31,14 +31,13 @@ overlay is silently skipped -- everything else still runs.
 
 --model (default: math) picks which calibrated pipeline predicts the
 gaze point: 'math' loads the GazeCalibrator profile scripts/calibrate.py
-saves by default; 'cnn' instead loads the CNN trained offline on
-data_raw (scripts/train_cnn.py) plus whatever per-user AffineCorrection
-scripts/calibrate.py --model cnn has saved for it (see
-gaze/cnn_calibration.py) -- uncorrected if calibrate.py --model cnn
+saves; 'cnn' instead loads the CNN trained offline on data_raw
+(scripts/train_cnn.py) plus whatever per-user AffineCorrection
+scripts/quick_calibrate.py has saved for it -- uncorrected if that
 hasn't been run yet.
 
-Run scripts/calibrate.py first (--model math or --model cnn, matching
-whichever --model you pass here). Then:
+Calibrate first, matching whichever --model you pass here: 'math' needs
+scripts/calibrate.py, 'cnn' needs scripts/quick_calibrate.py. Then:
   .venv\\Scripts\\python.exe scripts\\phase2_gaze_scroll.py
 Press 'q' to quit.
 """
@@ -63,7 +62,6 @@ from doomscroll.fixation.attention_gate import AttentionGate
 from doomscroll.fixation.mapper import to_window_relative_fraction
 from doomscroll.fixation.scroll_trigger import ScrollTrigger, ScrollTriggerConfig
 from doomscroll.gaze.calibration import GazeCalibrator, build_feature_vector
-from doomscroll.gaze.cnn_calibration import DEFAULT_CNN_PATH
 from doomscroll.gaze.feature_backend import GazeVectorExtractor, make_gaze_extractor
 from doomscroll.ml.model import load_gaze_model
 from doomscroll.gaze.gaze_vector import DEFAULT_MIN_EYE_ASPECT_RATIO, is_gaze_usable
@@ -85,6 +83,11 @@ DEBUG_WINDOW_TITLE = "doomscroll - Phase 2"  # a label only -- see windowing/mac
 # before it ever reaches smoothing, as a robustness backstop independent of
 # whatever's causing the extrapolation.
 EXTRAPOLATION_MARGIN = 0.5  # allow up to 50% of screen size beyond each edge
+
+# The CNN scripts/train_cnn.py trains offline, loaded here for --model cnn.
+# Defined locally (not imported from doomscroll.ml.cnn) so importing this
+# module never forces torch to be installed just to run --model math.
+DEFAULT_CNN_PATH = Path(__file__).resolve().parents[1] / "models" / "gaze_cnn.pt"
 
 
 # --- Backend setup -------------------------------------------------------
@@ -109,10 +112,9 @@ def _init_gaze_backend() -> tuple[GazeCalibrator, GazeVectorExtractor]:
 
 def _init_cnn_backend():
     """--model cnn: the CNN trained offline by scripts/train_cnn.py, with
-    whatever per-user AffineCorrection scripts/calibrate.py --model cnn
-    has saved for it already applied (see gaze/cnn_calibration.py) --
-    uncorrected if that hasn't been run yet, same as the math pipeline
-    running without having calibrated."""
+    whatever per-user AffineCorrection scripts/quick_calibrate.py has
+    saved for it already applied -- uncorrected if that hasn't been run
+    yet, same as the math pipeline running without having calibrated."""
     try:
         return load_gaze_model(DEFAULT_CNN_PATH, with_correction=True)
     except FileNotFoundError as e:
@@ -127,9 +129,9 @@ def main() -> None:
         choices=["math", "cnn"],
         default="math",
         help="Which calibrated pipeline predicts the gaze point (default: math) -- 'math' loads "
-        "the GazeCalibrator profile scripts/calibrate.py saves by default; 'cnn' loads the CNN "
-        "trained offline on data_raw plus whatever per-user correction scripts/calibrate.py "
-        "--model cnn has saved for it (see gaze/cnn_calibration.py).",
+        "the GazeCalibrator profile scripts/calibrate.py saves; 'cnn' loads the CNN trained "
+        "offline on data_raw plus whatever per-user correction scripts/quick_calibrate.py has "
+        "saved for it.",
     )
     parser.add_argument(
         "--content-only",
@@ -263,6 +265,22 @@ def main() -> None:
             timestamp_ms = cam.frame_timestamp_ms()
             result = backend.detect(frame, timestamp_ms)
 
+            # Refresh which window is focused on every camera frame,
+            # independent of whether this frame goes on to have a usable
+            # gaze point -- so the content analyser (OCR scan + the scroll
+            # trigger's own bounds) always follows whatever window is
+            # actually focused right now, never lagging behind to whatever
+            # was focused the last time gaze happened to be usable.
+            current_bounds = window_provider.get_focused_window_bounds()
+            # get_focused_window_bounds() itself already returns None
+            # whenever this very process is the frontmost application
+            # (see windowing/macos_backend.py) -- so our own webcam
+            # preview window can never come back here as "the focused
+            # window" in the first place. Just keep whatever the last
+            # genuinely-external window was when that happens.
+            if current_bounds is not None:
+                last_external_bounds = current_bounds
+
             head_pose = None
             points_px = None
             if result is not None:
@@ -328,15 +346,6 @@ def main() -> None:
                 blocks = bg_scanner.latest_blocks() if bg_scanner is not None else []
                 content_tracker.update(blocks, smoothed_point, timestamp_ms)
 
-                current_bounds = window_provider.get_focused_window_bounds()
-                # get_focused_window_bounds() itself already returns None
-                # whenever this very process is the frontmost application
-                # (see windowing/macos_backend.py) -- so our own webcam
-                # preview window can never come back here as "the focused
-                # window" in the first place. Just keep whatever the last
-                # genuinely-external window was when that happens.
-                if current_bounds is not None:
-                    last_external_bounds = current_bounds
                 bounds = last_external_bounds
 
                 if screen_overlay is not None and not overlay_broken and bounds is not None and bounds.width > 0 and bounds.height > 0:
