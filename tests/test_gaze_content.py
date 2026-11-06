@@ -64,18 +64,25 @@ def test_wider_block_requires_more_dwell_than_narrower_block_by_default():
 
 
 def test_default_dwell_has_a_floor_even_for_a_near_zero_width_block():
-    """The size-dependent dwell still has a floor (SEEN_DWELL_MIN_MS) --
+    """The size-dependent dwell still has a floor (SEEN_DWELL_MIN_MS=150) --
     a near-zero-width block shouldn't be markable as "seen" almost
-    instantly just because the width term contributes almost nothing."""
+    instantly just because the width term contributes almost nothing.
+
+    A 1px-wide block's required dwell is SEEN_DWELL_MIN_MS + 0.5*1 =
+    150.5ms, so 100ms must still be unseen and 200ms must be seen. (This
+    test previously used 480ms/520ms against an assumed ~500ms floor,
+    which never matched the actual SEEN_DWELL_MIN_MS=150 constant above --
+    480ms was already well past the real floor, so the "not yet seen"
+    assertion was failing against correct code, not catching a bug.)"""
     tracker = ContentGazeTracker()
     tiny = _block("i", x=0, y=0, w=1, h=20)
     gaze = np.array([0.5, 10.0])
 
     tracker.update([tiny], gaze, timestamp_ms=0)
-    tracker.update([tiny], gaze, timestamp_ms=480)  # below the ~500ms floor
+    tracker.update([tiny], gaze, timestamp_ms=100)  # below the ~150.5ms floor
     assert "i" not in tracker.seen_ids
 
-    tracker.update([tiny], gaze, timestamp_ms=520)  # past the floor
+    tracker.update([tiny], gaze, timestamp_ms=200)  # past the floor
     assert "i" in tracker.seen_ids
 
 

@@ -31,6 +31,19 @@ FAST_DWELL_MS = 150  # tiers 1 and 2: short, not skipped outright -- see module 
 CONTENT_TIER_DWELL_MS = 1000  # tier 3: the original, more conservative dwell
 COOLDOWN_MS = 800
 
+# Tier labels, named out here instead of inline string literals in update()
+# below -- update() compares the current tier against self._dwell_tier
+# (a plain string) every tick to decide whether to restart the dwell
+# timer, so a typo'd literal in one of the three branches would silently
+# create a tier that never matches a previously-stored one, breaking
+# dwell continuity with no error anywhere. Referencing these constants
+# instead doesn't change behaviour (same string values, checked against
+# tests/test_scroll_trigger.py's substring assertions below) -- it just
+# makes that typo class of bug a NameError instead of a silent one.
+TIER_BOTTOM15 = "bottom15"
+TIER_REACHED_END = "reached_end"
+TIER_CONTENT_OK = "content_ok"
+
 
 @dataclass
 class ScrollTriggerConfig:
@@ -72,11 +85,11 @@ class ScrollTrigger:
             return False, "cooldown..."
 
         if fy >= self._config.bottom_definite_fraction:
-            tier, required_ms = "bottom15", self._config.fast_dwell_ms
+            tier, required_ms = TIER_BOTTOM15, self._config.fast_dwell_ms
         elif content_available and self._tracker.has_reached_end(blocks, gaze_point):
-            tier, required_ms = "reached_end", self._config.fast_dwell_ms
+            tier, required_ms = TIER_REACHED_END, self._config.fast_dwell_ms
         elif content_available and self._tracker.should_scroll(blocks, gaze_point, viewport_bottom):
-            tier, required_ms = "content_ok", self._config.content_tier_dwell_ms
+            tier, required_ms = TIER_CONTENT_OK, self._config.content_tier_dwell_ms
         else:
             self._dwell_start_ms = None
             self._dwell_tier = None
