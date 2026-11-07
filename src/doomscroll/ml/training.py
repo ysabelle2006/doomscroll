@@ -1,16 +1,5 @@
-"""Model selection and fitting for the gaze model.
+# Pools session datasets and cross-validates candidate ridge/hgb/MLP models (math-model pipeline).
 
-Evaluation is the part that is easy to get wrong, so read this once:
-consecutive webcam frames are near-duplicates. A random train/test split puts
-neighbours of every test frame in the training set and reports a
-fantastically optimistic error. We therefore always hold out WHOLE groups:
-  - group_by="person": every session of one participant at a time (the honest
-    "works on someone it has never seen" number; needs >= 2 participants)
-  - >= 3 sessions: leave-sessions-out ("works on a new session", but the same
-    people can be in train and test)
-  - fewer: contiguous time blocks of BLOCK_S seconds within the sessions
-Error is reported in pixels (fraction error x that session's screen size).
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -31,8 +20,7 @@ BLOCK_S = 20.0
 MIN_SESSIONS_FOR_SESSION_CV = 3
 YAW_BINS_DEG = (-90, -25, -10, 10, 25, 90)
 
-# name -> factory. Add a candidate = add a line. "ridge" is the closest
-# stand-in for the old linear calibration, i.e. the baseline to beat.
+# Candidate model pipelines evaluated by evaluate_candidates().
 CANDIDATES = {
     "ridge": lambda: make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
     "mlp": lambda: make_pipeline(
@@ -45,18 +33,19 @@ CANDIDATES = {
 }
 
 
+# Pooled feature/target arrays from one or more sessions, with cross-validation groups.
 @dataclass
 class Pooled:
     X: np.ndarray
-    y: np.ndarray  # screen fractions
-    screen_wh: np.ndarray  # (N, 2) per-sample screen size, for px errors
+    y: np.ndarray
+    screen_wh: np.ndarray
     groups: np.ndarray
     cv_kind: str
-    participant: np.ndarray | None = None  # (N,) who each row belongs to, for the per-person report
+    participant: np.ndarray | None = None
 
 
+# Concatenates sessions into one Pooled dataset, grouped by session or by participant.
 def pool(sessions: list[LabeledFrames], group_by: str = "session") -> Pooled:
-    """group_by: "session" (default; leave-sessions-out or time blocks) or "person"."""
     if not sessions:
         raise ValueError("No datasets found. Run scripts/build_dataset.py first.")
     sessions = [s for s in sessions if len(s.X) > 0]
@@ -83,10 +72,12 @@ def pool(sessions: list[LabeledFrames], group_by: str = "session") -> Pooled:
     return Pooled(X, y, wh, groups, kind, who)
 
 
+# Converts fraction-space errors to pixel distances.
 def pixel_errors(pred_frac: np.ndarray, true_frac: np.ndarray, screen_wh: np.ndarray) -> np.ndarray:
     return np.linalg.norm((pred_frac - true_frac) * screen_wh, axis=1)
 
 
+# Cross-validates a model factory with group k-fold, returning out-of-fold predictions.
 def out_of_fold_predictions(factory, data: Pooled, n_splits: int = 5) -> np.ndarray:
     n_groups = len(np.unique(data.groups))
     if n_groups < 2:
@@ -99,8 +90,8 @@ def out_of_fold_predictions(factory, data: Pooled, n_splits: int = 5) -> np.ndar
     return pred
 
 
+# Buckets pixel errors by head-yaw range.
 def error_by_yaw(errors: np.ndarray, yaw_deg: np.ndarray) -> list[tuple[str, int, float]]:
-    """Mean px error per head-yaw bin: the direct measure of the head-angle problem."""
     rows = []
     for lo, hi in zip(YAW_BINS_DEG[:-1], YAW_BINS_DEG[1:]):
         m = (yaw_deg >= lo) & (yaw_deg < hi)
@@ -109,13 +100,13 @@ def error_by_yaw(errors: np.ndarray, yaw_deg: np.ndarray) -> list[tuple[str, int
     return rows
 
 
+# Buckets pixel errors by an arbitrary group label (e.g. session or person).
 def error_by_group(errors: np.ndarray, labels: np.ndarray) -> list[tuple[str, int, float]]:
-    """Mean px error per label (e.g. per participant)."""
     return [(str(g), int((labels == g).sum()), float(errors[labels == g].mean())) for g in sorted(set(labels))]
 
 
+# Cross-validates each named candidate model and reports its error breakdown.
 def evaluate_candidates(data: Pooled, names: list[str] | None = None) -> dict[str, dict]:
-    """-> {name: {"mean_px", "median_px", "p90_px", "by_yaw", "by_person"}} from out-of-fold predictions."""
     report = {}
     for name in names or list(CANDIDATES):
         pred = out_of_fold_predictions(CANDIDATES[name], data)
@@ -129,6 +120,7 @@ def evaluate_candidates(data: Pooled, names: list[str] | None = None) -> dict[st
     return report
 
 
+# Fits one named candidate model on the full dataset (no held-out split).
 def fit_final(name: str, data: Pooled):
     model = CANDIDATES[name]()
     model.fit(data.X, data.y)

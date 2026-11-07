@@ -1,25 +1,4 @@
-"""Records the webcam, and the cursor position at every webcam frame.
-
-HOW SYNC WORKS (the whole trick): everything happens in ONE process, ONE loop,
-on ONE clock. For every frame the camera hands us we immediately
-
-    1. stamp it with t = perf_counter() - t0,
-    2. read the cursor position,
-    3. write the frame to webcam.mp4 and (frame_idx, t, cursor) to frames.csv.
-
-So "frame i of the video" and "row i of the CSV" are the same instant by
-construction -- there are no separate recordings to line up afterwards, and
-no assumption about fps. (The mp4's own fps header is only nominal: webcams
-drop/stretch frames, so ALWAYS use t_ms from the CSV, never frame_idx / fps.)
-
-Remaining error is camera latency (the frame was exposed ~30-100 ms before we
-received it) and human latency (the eye reaches a target before the hand
-moves the cursor there). Both are handled as ONE tunable offset when building
-the dataset (`label_lag_ms`, see ml/labels.py), not here.
-
-The recorder does NOT run MediaPipe: keeping the loop light gives a higher,
-steadier fps, and means group-mates collecting data don't need the ML setup.
-"""
+# Records webcam frames (and optionally screen) with cursor position to disk.
 from __future__ import annotations
 
 import csv
@@ -33,33 +12,39 @@ import numpy as np
 from doomscroll.recording.screen import ScreenRecorder
 from doomscroll.recording.session import FRAME_LOG_COLUMNS, SessionMeta, SessionPaths
 
-NOMINAL_VIDEO_FPS = 30  # container header only, see module docstring
-FLUSH_EVERY_N_FRAMES = 60  # a crash loses at most ~2 s of the CSV
+# Nominal output video fps and CSV flush interval.
+NOMINAL_VIDEO_FPS = 30
+FLUSH_EVERY_N_FRAMES = 60
 
 
+# Protocol for a frame-producing camera source.
 class FrameSource(Protocol):
     def read(self) -> tuple[bool, np.ndarray | None]: ...
 
 
+# Protocol for a cursor-position source.
 class CursorSource(Protocol):
     def position(self) -> tuple[float, float]: ...
 
 
+# CursorSource backed by pynput's mouse controller.
 class PynputCursor:
-    """Global mouse position (works while another app is focused).
-    macOS: needs Accessibility permission for the terminal/IDE running this."""
 
+    # Creates the pynput mouse controller.
     def __init__(self):
         from pynput.mouse import Controller
 
         self._mouse = Controller()
 
+    # Returns the current mouse position.
     def position(self) -> tuple[float, float]:
         x, y = self._mouse.position
         return float(x), float(y)
 
 
+# Captures webcam frames (and optional screen) to video, logging timestamps/cursor to CSV.
 class Recorder:
+    # Stores the camera/cursor sources, output paths and session metadata.
     def __init__(
         self,
         camera: FrameSource,
@@ -70,14 +55,13 @@ class Recorder:
         clock: Callable[[], float] = time.perf_counter,
         on_frame: Callable[[int, float, np.ndarray], bool] | None = None,
     ):
-        """on_frame(idx, t_ms, frame) is called per frame (e.g. for a preview
-        window); return True to request stop."""
         self._camera, self._cursor = camera, cursor
         self._paths, self._meta = paths, meta
         self._record_screen = record_screen
         self._clock = clock
         self._on_frame = on_frame
 
+    # Runs the capture loop until duration_s elapses or should_stop() is true.
     def run(self, duration_s: float, should_stop: Callable[[], bool] = lambda: False) -> SessionMeta:
         paths, meta = self._paths, self._meta
         paths.create()
@@ -98,10 +82,10 @@ class Recorder:
                 log.writerow(FRAME_LOG_COLUMNS)
                 while not should_stop():
                     ok, frame = self._camera.read()
-                    t_ms = (self._clock() - t0) * 1000.0  # stamp as soon as the frame arrives
+                    t_ms = (self._clock() - t0) * 1000.0
                     cx, cy = self._cursor.position()
                     if not ok or frame is None:
-                        continue  # a failed read is simply not a frame: no row, no video frame
+                        continue
                     if t_ms > duration_s * 1000.0:
                         break
 
@@ -132,5 +116,5 @@ class Recorder:
             meta.has_screen_video = screen is not None and screen.error is None and paths.screen_video.exists()
             if screen is not None and screen.error is not None:
                 meta.extra["screen_error"] = repr(screen.error)
-            paths.write_meta(meta)  # written even on Ctrl+C / crash, so partial sessions stay usable
+            paths.write_meta(meta)
         return meta

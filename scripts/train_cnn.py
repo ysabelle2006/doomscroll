@@ -1,17 +1,4 @@
-"""Train the appearance-based gaze CNN (eye crops + face + landmark features).
-
-    python scripts/train_cnn.py                     # honest held-out test, then train final model
-    python scripts/train_cnn.py --skip-cv           # just train the final model (fast iteration)
-    python scripts/train_cnn.py --no-aux            # pure-pixel CNN (ablation: what do the images add?)
-    python scripts/train_cnn.py --epochs 40 --train-stride 2
-    python scripts/train_cnn.py --cv person         # hold out whole PEOPLE: works on someone new?
-
-Needs crop datasets from scripts/build_crops.py (datasets/crops/, at the
-project root -- see doomscroll.recording.session), and torch (pip install
-torch). Prints the CNN's held-out pixel error NEXT TO ridge and hgb trained
-on the SAME frames with the SAME folds, so the comparison is fair. Output:
-models/gaze_cnn.pt (use it with: phase2_gaze_scroll.py --model models/gaze_cnn.pt).
-"""
+# Trains the appearance-based gaze CNN on crop datasets and compares it against ridge/hgb baselines.
 from __future__ import annotations
 
 import argparse
@@ -36,12 +23,14 @@ from doomscroll.recording.session import CROPS_DIR
 ROOT = Path(__file__).resolve().parents[1] / "data"
 
 
+# Summarizes one model's pixel errors overall, by head yaw, and by person.
 def summarize(err: np.ndarray, yaw: np.ndarray, who: np.ndarray) -> dict:
     return {"mean_px": float(err.mean()), "median_px": float(np.median(err)),
             "p90_px": float(np.percentile(err, 90)), "by_yaw": error_by_yaw(err, yaw),
             "by_person": error_by_group(err, who)}
 
 
+# Prints a side-by-side error table for all models in the report.
 def print_report(report: dict) -> None:
     print(f"\n{'model':8s} {'mean':>8s} {'median':>8s} {'p90':>8s}   (pixels, held-out, same frames & folds)")
     for name, r in report.items():
@@ -55,8 +44,8 @@ def print_report(report: dict) -> None:
         print(f"  {label:18s} n={n:6d}  " + "  ".join(f"{report[m]['by_person'][i][2]:7.0f}" for m in names))
 
 
+# Reads the cursor-lag stored by train_model.py, or 0 if unavailable.
 def default_lag() -> float:
-    """Reuse the lag train_model.py's lag sweep picked, if that model exists."""
     try:
         import joblib
 
@@ -65,8 +54,25 @@ def default_lag() -> float:
         return 0.0
 
 
+_DESCRIPTION = """Train the appearance-based gaze CNN (eye crops + face + landmark features).
+
+    python scripts/train_cnn.py                     # honest held-out test, then train final model
+    python scripts/train_cnn.py --skip-cv           # just train the final model (fast iteration)
+    python scripts/train_cnn.py --no-aux            # pure-pixel CNN (ablation: what do the images add?)
+    python scripts/train_cnn.py --epochs 40 --train-stride 2
+    python scripts/train_cnn.py --cv person         # hold out whole PEOPLE: works on someone new?
+
+Needs crop datasets from scripts/build_crops.py (datasets/crops/, at the
+project root -- see doomscroll.recording.session), and torch (pip install
+torch). Prints the CNN's held-out pixel error NEXT TO ridge and hgb trained
+on the SAME frames with the SAME folds, so the comparison is fair. Output:
+models/gaze_cnn.pt, the fixed path phase2_gaze_scroll.py reads when run with --model cnn.
+"""
+
+
+# Loads crop data, optionally cross-validates, then trains and saves the final CNN.
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=_DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--crops", type=Path, default=CROPS_DIR)
     ap.add_argument("--out", type=Path, default=DEFAULT_CNN_PATH)
     ap.add_argument("--lag-ms", type=float, default=None, help="default: the lag stored in models/gaze_model.joblib, else 0")

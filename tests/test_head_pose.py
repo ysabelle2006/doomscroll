@@ -1,15 +1,4 @@
-"""Tests for doomscroll.gaze.head_pose: the solvePnP-based yaw/pitch/roll +
-translation estimate that feeds into calibration alongside the eye-in-head
-gaze feature.
-
-Rather than synthetic-but-arbitrary landmarks, this builds landmarks by
-*projecting* head_pose.py's own 3D face model through a chosen, known
-camera pose (cv2.projectPoints) -- an exact analytic round-trip: feed in a
-known yaw/pitch/roll/translation, and HeadPoseEstimator.estimate() should
-recover (close to) that same pose back out. This exercises the real
-solvePnP + Euler-angle decomposition + pitch-unwrap pipeline, not a
-hand-wavy approximation of it.
-"""
+# Tests for HeadPoseEstimator's PnP-based pose recovery and pitch unwrapping.
 from __future__ import annotations
 
 import cv2
@@ -24,19 +13,13 @@ from doomscroll.gaze.head_pose import (
     _camera_matrix,
 )
 
+# Image size and landmark count used across these tests.
 IMAGE_W, IMAGE_H = 640, 480
 N_LANDMARKS = 478
 
 
+# Projects a synthetic 3D head pose into 2D landmark pixel positions.
 def _project_pose_to_landmarks(yaw_deg: float, pitch_deg: float, roll_deg: float, tvec: np.ndarray) -> np.ndarray:
-    """Builds a (478, 2) landmark array whose 6 head-pose landmarks are the
-    exact projection of _MODEL_POINTS_3D under the given pose -- the
-    ground truth HeadPoseEstimator.estimate() should recover."""
-    # OpenCV's rotation vector is axis-angle, not Euler angles directly;
-    # build the rotation matrix from yaw/pitch/roll via the same
-    # convention cv2.decomposeProjectionMatrix uses (XYZ order) by
-    # composing elementary rotations and letting cv2.Rodrigues convert
-    # back to a rotation vector for projectPoints.
     y, p, r = np.radians([pitch_deg, yaw_deg, roll_deg])
     Rx = np.array([[1, 0, 0], [0, np.cos(y), -np.sin(y)], [0, np.sin(y), np.cos(y)]])
     Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
@@ -55,20 +38,20 @@ def _project_pose_to_landmarks(yaw_deg: float, pitch_deg: float, roll_deg: float
     return pts
 
 
+# Checks normal pitch values pass through unchanged.
 def test_unwrap_pitch_leaves_normal_values_unchanged():
     assert _unwrap_pitch(0.0) == 0.0
     assert _unwrap_pitch(45.0) == 45.0
     assert _unwrap_pitch(-45.0) == -45.0
 
 
+# Checks pitch wraps correctly near +180 degrees.
 def test_unwrap_pitch_wraps_near_positive_180():
-    # decomposeProjectionMatrix can report a frontal-ish face as pitch near
-    # +/-180 depending on sign convention; _unwrap_pitch folds that back to
-    # the equivalent near-zero angle a frontal face should read as.
     assert _unwrap_pitch(170.0) == pytest.approx(10.0)
     assert _unwrap_pitch(100.0) == pytest.approx(80.0)
 
 
+# Checks pitch wraps correctly near -180 degrees.
 def test_unwrap_pitch_wraps_near_negative_180():
     assert _unwrap_pitch(-170.0) == pytest.approx(-10.0)
     assert _unwrap_pitch(-100.0) == pytest.approx(-80.0)
@@ -77,14 +60,15 @@ def test_unwrap_pitch_wraps_near_negative_180():
 @pytest.mark.parametrize(
     "yaw,pitch,roll",
     [
-        (0.0, 0.0, 0.0),      # straight-on
-        (15.0, 0.0, 0.0),     # turned right
-        (-15.0, 0.0, 0.0),    # turned left
-        (0.0, 10.0, 0.0),     # chin up/down a little (small -- see calibrate.py's own caution about losing face)
+        (0.0, 0.0, 0.0),
+        (15.0, 0.0, 0.0),
+        (-15.0, 0.0, 0.0),
+        (0.0, 10.0, 0.0),
         (0.0, -10.0, 0.0),
-        (10.0, -8.0, 5.0),    # a realistic combined incidental pose
+        (10.0, -8.0, 5.0),
     ],
 )
+# Checks the estimator recovers a known synthetic yaw/pitch/roll/position.
 def test_estimate_recovers_known_pose(yaw, pitch, roll):
     tvec = np.array([[0.0], [0.0], [400.0]])
     landmarks_px = _project_pose_to_landmarks(yaw, pitch, roll, tvec)
@@ -99,10 +83,8 @@ def test_estimate_recovers_known_pose(yaw, pitch, roll):
     np.testing.assert_allclose(result.translation_vector.flatten(), tvec.flatten(), atol=5.0)
 
 
+# Checks a second estimate seeded by the previous one is consistent.
 def test_estimate_uses_previous_pose_as_seed():
-    """Feeding two frames of the same pose shouldn't flip to a different
-    (degenerate) solvePnP solution the second time -- the estimator should
-    settle on a consistent answer once seeded."""
     tvec = np.array([[0.0], [0.0], [400.0]])
     landmarks_px = _project_pose_to_landmarks(5.0, 5.0, 0.0, tvec)
     estimator = HeadPoseEstimator()
@@ -115,10 +97,8 @@ def test_estimate_uses_previous_pose_as_seed():
     assert second.pitch_deg == pytest.approx(first.pitch_deg, abs=0.5)
 
 
+# Checks an extreme roll angle is rejected as an invalid estimate.
 def test_estimate_rejects_extreme_roll():
-    """Roll > 90 degrees is treated as a bad/degenerate solve (see the
-    sanity check in estimate()) and should return None, not a nonsense
-    pose."""
     tvec = np.array([[0.0], [0.0], [400.0]])
     landmarks_px = _project_pose_to_landmarks(0.0, 0.0, 120.0, tvec)
     estimator = HeadPoseEstimator()
@@ -126,6 +106,7 @@ def test_estimate_rejects_extreme_roll():
     assert result is None
 
 
+# Checks reset() clears the estimator's seeded previous pose.
 def test_estimate_reset_clears_seed():
     tvec = np.array([[0.0], [0.0], [400.0]])
     landmarks_px = _project_pose_to_landmarks(5.0, 5.0, 0.0, tvec)

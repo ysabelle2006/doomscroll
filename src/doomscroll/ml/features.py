@@ -1,17 +1,5 @@
-"""THE single definition of "what the gaze model sees".
+# Extracts the CNN/ridge-model's per-frame feature vector (gaze, eyelid, head pose).
 
-Both dataset building (offline, from recorded video) and live inference call
-`extract_features`, so training and runtime cannot drift apart. If you add or
-reorder a feature, change FEATURE_NAMES and extract_features together; saved
-models store FEATURE_NAMES and refuse to load if they no longer match.
-
-Compared to the old 7-number vector (calibration.build_feature_vector) this
-adds what the head-angle problem was missing:
-  - head TRANSLATION (where the face is in the frame, and how far away): the
-    same eye rotation maps to a different screen point when you lean/shift.
-  - eyelid-relative vertical iris position: vertical gaze is poorly captured
-    by corner-normalized offsets because the eyelids move with gaze.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -30,27 +18,28 @@ from doomscroll.gaze.gaze_vector import (
 )
 from doomscroll.gaze.head_pose import HeadPose
 
+# Names of each value in the feature vector, in order.
 FEATURE_NAMES = (
-    "gaze_mean_x", "gaze_mean_y", "gaze_diff_x", "gaze_diff_y",  # iris in eye, corner-normalized
-    "lid_ratio_y",                                              # iris between top/bottom eyelid, 0..1
-    "yaw", "pitch", "roll",                                     # head rotation, degrees
-    "head_tx", "head_ty", "head_tz",                            # head position from solvePnP (model units ~mm)
+    "gaze_mean_x", "gaze_mean_y", "gaze_diff_x", "gaze_diff_y",
+    "lid_ratio_y",
+    "yaw", "pitch", "roll",
+    "head_tx", "head_ty", "head_tz",
 )
 FEATURE_DIM = len(FEATURE_NAMES)
 YAW_INDEX = FEATURE_NAMES.index("yaw")
 
 
+# Returns how far the iris sits between the eyelids (0=top, 1=bottom).
 def _lid_ratio(points_px: np.ndarray, top: int, bottom: int, iris: int) -> float:
     top_y, bottom_y, iris_y = points_px[top][1], points_px[bottom][1], points_px[iris][1]
     span = bottom_y - top_y
     return float((iris_y - top_y) / span) if abs(span) > 1e-6 else 0.5
 
 
+# Builds one frame's full feature vector from landmarks and head pose.
 def extract_features(
     points_px: np.ndarray, head_pose: HeadPose, frame_gray: np.ndarray | None = None
 ) -> np.ndarray:
-    """points_px: (478, 2) landmarks in pixels. Returns (FEATURE_DIM,) float64.
-    Callers should check is_gaze_usable() first (blink) -- see FrameFeaturizer."""
     gaze = compute_gaze_feature(points_px, frame_gray=frame_gray).vector
     lid = 0.5 * (
         _lid_ratio(points_px, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_IRIS_CENTER)
@@ -62,41 +51,38 @@ def extract_features(
     ).astype(np.float64)
 
 
+# One frame's extraction result: features (if usable) plus the reason if not.
 @dataclass
 class FrameResult:
-    """Everything known about one frame. features is None unless reason == "ok"."""
 
     features: np.ndarray | None
-    reason: str  # "ok" | "no_face" | "no_pose" | "blink"
+    reason: str
     points_px: np.ndarray | None = None
     pose: HeadPose | None = None
     gray: np.ndarray | None = None
 
 
+# Runs landmark detection, pose estimation, and feature extraction for a sequence of frames.
 class FrameFeaturizer:
-    """frame (BGR) -> feature vector, or None plus a reason string.
-    Stateful (head-pose solver is seeded by the previous frame), so feed it
-    frames in order and call reset() between videos."""
 
     def __init__(self, backend=None, pose_estimator=None):
-        # Imported lazily so code that only needs the pure functions above
-        # (tests, training) doesn't need a working mediapipe install.
         from doomscroll.gaze.head_pose import HeadPoseEstimator
         from doomscroll.landmarks.mediapipe_backend import MediaPipeLandmarkBackend
 
         self._backend = backend or MediaPipeLandmarkBackend()
         self._pose = pose_estimator or HeadPoseEstimator()
 
+    # Resets the head-pose estimator's previous-frame state (e.g. between sessions).
     def reset(self) -> None:
         self._pose.reset()
 
+    # Returns just (features, reason) for one frame; see process_full for the full result.
     def process(self, frame_bgr: np.ndarray, timestamp_ms: int) -> tuple[np.ndarray | None, str]:
         r = self.process_full(frame_bgr, timestamp_ms)
         return r.features, r.reason
 
+    # Runs the full per-frame pipeline: landmarks, pose, blink check, then feature extraction.
     def process_full(self, frame_bgr: np.ndarray, timestamp_ms: int) -> "FrameResult":
-        """Like process(), but also returns the landmarks, pose and gray frame
-        (the CNN needs the pixels, not just the feature vector)."""
         import cv2
 
         result = self._backend.detect(frame_bgr, timestamp_ms)
@@ -112,5 +98,6 @@ class FrameFeaturizer:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         return FrameResult(extract_features(points_px, pose, gray), "ok", points_px, pose, gray)
 
+    # Releases the landmark backend's resources.
     def close(self) -> None:
         self._backend.close()

@@ -1,16 +1,19 @@
-"""Common interface for synthetic OS-level scroll injection, per-OS."""
+# Abstract interface for injecting scroll events into the OS.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 
 
+# Unit a scroll amount is expressed in.
 class ScrollUnit(Enum):
     LINE = auto()
     PIXEL = auto()
 
 
+# Platform backends implement this to send scroll input.
 class ScrollInjector(ABC):
+    # Scrolls by dx/dy in the given unit, optionally at a target point.
     @abstractmethod
     def scroll(
         self,
@@ -19,11 +22,4 @@ class ScrollInjector(ABC):
         unit: ScrollUnit = ScrollUnit.LINE,
         target_point: tuple[int, int] | None = None,
     ) -> None:
-        """Inject a synthetic scroll event. Positive dy scrolls down,
-        positive dx scrolls right, matching natural reading-direction sign
-        convention used elsewhere in this project.
-
-        target_point, if given, is a screen-pixel point the event should be
-        targeted at (e.g. the focused window's center) -- both OS backends
-        briefly move the cursor there and restore it afterward, since wheel
-        events are delivered based on cursor position, not window focus."""
+        pass

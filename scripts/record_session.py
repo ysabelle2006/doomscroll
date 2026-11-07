@@ -1,18 +1,4 @@
-"""Record one data-collection session: webcam video + cursor position at
-every frame (+ optional screen recording), all on one clock.
-
-    python scripts/record_session.py --participant nicole --duration 300
-    python scripts/record_session.py --participant nicole --screen --notes "head turned left"
-
-HOW TO COLLECT GOOD DATA (this matters more than any model choice):
-  * Look AT the cursor the whole time and keep moving it -- sweep corners,
-    edges, zig-zags, slow and fast. Frames where the cursor is idle are discarded.
-  * Vary your head: do separate sessions (or segments) with head forward,
-    turned left/right, tilted up/down, leaning closer/further, and say so in --notes.
-  * Vary conditions across sessions: lighting, glasses on/off, time of day.
-  * Don't touch the keyboard/mouse in ways that pull your eyes from the cursor.
-Ctrl+C stops early; the partial session is kept.
-"""
+# Records one webcam+cursor (and optionally screen) data-collection session to disk.
 from __future__ import annotations
 
 import argparse
@@ -36,8 +22,26 @@ DEFAULT_OUT = Path(__file__).resolve().parents[1] / "data" / "recordings"
 PREVIEW_WIDTH = 320
 
 
+_DESCRIPTION = """Record one data-collection session: webcam video + cursor position at
+every frame (+ optional screen recording), all on one clock.
+
+    python scripts/record_session.py --participant nicole --duration 300
+    python scripts/record_session.py --participant nicole --screen --notes "head turned left"
+
+HOW TO COLLECT GOOD DATA (this matters more than any model choice):
+  * Look AT the cursor the whole time and keep moving it -- sweep corners,
+    edges, zig-zags, slow and fast. Frames where the cursor is idle are discarded.
+  * Vary your head: do separate sessions (or segments) with head forward,
+    turned left/right, tilted up/down, leaning closer/further, and say so in --notes.
+  * Vary conditions across sessions: lighting, glasses on/off, time of day.
+  * Don't touch the keyboard/mouse in ways that pull your eyes from the cursor.
+Ctrl+C stops early; the partial session is kept.
+"""
+
+
+# Parses args, then records webcam frames + cursor position until --duration elapses or Ctrl+C.
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=_DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "--participant", default=None,
         help="short name, e.g. 'nicole' -- NOT used in the folder/file name or saved anywhere on disk; "
@@ -56,15 +60,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
 
-    ensure_dpi_aware()  # must precede get_screen_size so cursor and screen size share one coordinate space
+    ensure_dpi_aware()
     screen_w, screen_h = get_screen_size()
-    # session_id (and therefore every file/folder name touched below) is
-    # <hashid>_<date>_<recordID> -- never the participant's real name; see
-    # doomscroll.recording.session's own docstring. Scanning CROPS_DIR/
-    # FEATURES_DIR too (not just this recording's own --out) is what lets
-    # a brand new recording continue this participant's existing
-    # numbering instead of colliding with sessions already built from
-    # data recorded earlier.
     participant = args.participant or get_default_participant()
     session_id = make_session_id(participant, CROPS_DIR, FEATURES_DIR, args.out)
     hashid = participant_hashid(participant)
@@ -73,6 +70,7 @@ def main() -> None:
 
     last_print = [0.0]
 
+    # Per-frame callback: prints progress, and optionally shows a preview window.
     def on_frame(idx: int, t_ms: float, frame) -> bool:
         if t_ms - last_print[0] >= 1000:
             last_print[0] = t_ms
@@ -92,7 +90,7 @@ def main() -> None:
         try:
             meta = recorder.run(args.duration)
         except KeyboardInterrupt:
-            meta = paths.read_meta()  # Recorder's finally-block already saved it
+            meta = paths.read_meta()
     cv2.destroyAllWindows()
 
     print(f"\nSaved {meta.n_frames} frames, {meta.duration_s:.0f}s, {meta.measured_fps:.1f} fps -> {paths.dir}")

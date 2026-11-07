@@ -1,12 +1,5 @@
-"""Recorded session folder -> eye/face crops + landmark features (one .npz per session).
+# Builds and stores per-session eye/face crop datasets (CNN pipeline) from recordings.
 
-The CNN counterpart of ml/dataset.py. Same rules: the slow MediaPipe pass is
-done once (scripts/build_crops.py); labels (lag, idle-cursor filter) are made
-at training time from the raw cursor log, so they can be swept for free.
-
-Crops are stored only for usable frames ("ok"), to keep the files small:
-`rows[k]` is the frame index of crop k.
-"""
 from __future__ import annotations
 
 import json
@@ -23,35 +16,36 @@ from doomscroll.ml.features import FEATURE_DIM, FEATURE_NAMES, FrameResult
 from doomscroll.ml.labels import make_labels
 from doomscroll.recording.session import SessionPaths
 
-# frame, timestamp -> FrameResult. Matches FrameFeaturizer.process_full, so
-# tests can pass a fake instead of running MediaPipe.
 ProcessFn = Callable[[np.ndarray, int], FrameResult]
 
 
+# One session's extracted crops, features, and labels, one row per usable frame.
 @dataclass
 class CropSession:
     session_id: str
     participant: str
     screen_wh: tuple[int, int]
-    t_ms: np.ndarray       # (N,) every logged frame
-    cursor_xy: np.ndarray  # (N, 2) px
-    reasons: np.ndarray    # (N,)
-    rows: np.ndarray       # (K,) frame index of each stored crop (reason == "ok", maybe strided)
-    X: np.ndarray          # (K, FEATURE_DIM) landmark features for those frames
-    eyes: np.ndarray       # (K, 2, EYE_H, EYE_W) uint8
-    face: np.ndarray       # (K, FACE_SIZE, FACE_SIZE) uint8
+    t_ms: np.ndarray
+    cursor_xy: np.ndarray
+    reasons: np.ndarray
+    rows: np.ndarray
+    X: np.ndarray
+    eyes: np.ndarray
+    face: np.ndarray
 
+    # Returns the (local index, target fraction) of rows that pass the activity/on-screen filter.
     def labeled_index(self, lag_ms=0.0, window_ms=600.0, min_travel_px=40.0) -> tuple[np.ndarray, np.ndarray]:
-        """-> (k indices into the crop arrays with a trustworthy label, y_frac (len(k), 2))."""
         y_frac, ok = make_labels(self.t_ms, self.cursor_xy, self.screen_wh, lag_ms, window_ms, min_travel_px)
         k = np.flatnonzero(ok[self.rows])
         return k, y_frac[self.rows[k]]
 
+    # Counts frames by extraction outcome (ok / no_face / blink / etc).
     def summary(self) -> dict:
         d = {k: int(v) for k, v in zip(*np.unique(self.reasons, return_counts=True))}
         d["stored_crops"] = int(len(self.rows))
         return d
 
+    # Saves this dataset to a compressed .npz file.
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -61,6 +55,7 @@ class CropSession:
                              "screen_wh": list(self.screen_wh), "crop_spec": CROP_SPEC}),
         )
 
+    # Loads a dataset previously saved with save().
     @classmethod
     def load(cls, path: Path) -> "CropSession":
         d = np.load(path, allow_pickle=False)
@@ -71,15 +66,13 @@ class CropSession:
                    d["t_ms"], d["cursor_xy"], d["reasons"], d["rows"], d["X"], d["eyes"], d["face"])
 
 
+# Runs process() over every frame of a recorded session's video, extracting crops for usable ones.
 def build_crop_session(
     session_dir: Path | str,
     process: ProcessFn,
     stride: int = 1,
     progress: Callable[[int, int], None] | None = None,
 ) -> CropSession:
-    """stride > 1 runs MediaPipe on (and stores) only every stride-th frame:
-    neighbouring frames are near-duplicates, so stride 2 loses little and
-    halves the build time and file size."""
     paths = SessionPaths(session_dir)
     meta = paths.read_meta()
     t_ms, cursor_xy = read_frame_log(paths.frames_csv)
@@ -123,5 +116,6 @@ def build_crop_session(
     )
 
 
+# Loads every crop dataset (.npz) in a directory.
 def load_all_crops(crop_dir: Path | str) -> list[CropSession]:
     return [CropSession.load(p) for p in sorted(Path(crop_dir).glob("*.npz"))]

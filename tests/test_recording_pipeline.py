@@ -1,5 +1,4 @@
-"""End-to-end test of record -> build dataset -> train, with a fake camera,
-fake cursor and fake feature extractor (no webcam / MediaPipe needed)."""
+# End-to-end tests covering recording, dataset building, training and model persistence.
 from __future__ import annotations
 
 import numpy as np
@@ -14,9 +13,11 @@ from doomscroll.recording.recorder import Recorder
 from doomscroll.recording.screen import nearest_index
 from doomscroll.recording.session import SessionMeta, SessionPaths
 
+# Shared synthetic screen size.
 SCREEN = (1000, 600)
 
 
+# Controllable fake clock for deterministic timing in tests.
 class FakeClock:
     def __init__(self):
         self.t = 0.0
@@ -25,8 +26,8 @@ class FakeClock:
         return self.t
 
 
+# Fake camera that returns solid-color frames, optionally failing periodically.
 class FakeCamera:
-    """30 fps camera; each frame encodes its index in pixel (0,0) and advances the clock."""
 
     def __init__(self, clock: FakeClock, fail_every: int = 0):
         self.clock, self.i, self.fail_every, self.reads = clock, 0, fail_every, 0
@@ -41,8 +42,8 @@ class FakeCamera:
         return True, frame
 
 
+# Fake cursor that sweeps horizontally across the screen over time.
 class SweepingCursor:
-    """Cursor sweeps left->right across the screen once per second."""
 
     def __init__(self, clock: FakeClock):
         self.clock = clock
@@ -51,6 +52,7 @@ class SweepingCursor:
         return (self.clock.t % 1.0) * SCREEN[0], 300.0
 
 
+# Records a session with fake camera/cursor sources for the given duration.
 def record(tmp_path, duration=4.0, fail_every=0):
     clock = FakeClock()
     paths = SessionPaths(tmp_path / "s1")
@@ -59,10 +61,11 @@ def record(tmp_path, duration=4.0, fail_every=0):
     return paths, rec.run(duration)
 
 
+# Checks every written video frame has exactly one matching CSV log row.
 def test_every_video_frame_has_exactly_one_log_row(tmp_path):
     import cv2
 
-    paths, meta = record(tmp_path, fail_every=7)  # failed reads must not desync video and log
+    paths, meta = record(tmp_path, fail_every=7)
     t, xy = read_frame_log(paths.frames_csv)
     cap = cv2.VideoCapture(str(paths.webcam_video))
     n_video = 0
@@ -74,12 +77,14 @@ def test_every_video_frame_has_exactly_one_log_row(tmp_path):
     assert paths.read_meta().n_frames == meta.n_frames
 
 
+# Checks recording into an existing session directory raises instead of overwriting.
 def test_session_never_overwritten(tmp_path):
     record(tmp_path)
     with pytest.raises(FileExistsError):
         record(tmp_path)
 
 
+# Checks an interrupted recording still writes partial metadata to disk.
 def test_partial_session_keeps_meta_when_interrupted(tmp_path):
     clock = FakeClock()
     paths = SessionPaths(tmp_path / "s2")
@@ -96,6 +101,7 @@ def test_partial_session_keeps_meta_when_interrupted(tmp_path):
     assert paths.read_meta().n_frames > 10
 
 
+# Checks activity_mask/make_labels/cursor_at behave correctly for still vs moving cursors.
 def test_labels_lag_and_idle_filter():
     t = np.arange(0, 3000, 33.3)
     still = np.tile([500.0, 300.0], (len(t), 1))
@@ -105,18 +111,18 @@ def test_labels_lag_and_idle_filter():
     y, keep = make_labels(t, moving, SCREEN, lag_ms=0)
     assert y[0, 0] == pytest.approx(0.0) and keep.all()
     y_lag, _ = make_labels(t, moving, SCREEN, lag_ms=300)
-    assert y_lag[10, 0] > y[10, 0]  # label taken from the cursor's FUTURE position
+    assert y_lag[10, 0] > y[10, 0]
     np.testing.assert_allclose(cursor_at(np.array([50.0]), np.array([0.0, 100.0]), np.array([[0, 0], [10, 20.0]])), [[5, 10]])
 
 
+# Checks nearest_index finds the closest timestamp for various queries.
 def test_nearest_index():
     ts = np.array([0.0, 100.0, 200.0])
     assert [nearest_index(q, ts) for q in (-5, 40, 60, 149, 151, 999)] == [0, 0, 1, 1, 2, 2]
 
 
+# Builds a fake featurizer that reports a blink every 10th frame.
 def fake_featurize_factory():
-    """Pretend gaze features: the 'iris' tracks cursor x in the frame index, so
-    ridge can learn it. Frame content is ignored; we use call order."""
     calls = {"i": 0}
 
     def featurize(frame, ts_ms):
@@ -129,6 +135,7 @@ def fake_featurize_factory():
     return featurize
 
 
+# Checks building a session dataset drops blinks correctly and round-trips via save/load.
 def test_dataset_build_drops_and_labels(tmp_path):
     paths, meta = record(tmp_path)
     ds = build_session_dataset(paths.dir, fake_featurize_factory())
@@ -144,9 +151,8 @@ def test_dataset_build_drops_and_labels(tmp_path):
     assert again.screen_wh == SCREEN
 
 
+# Builds synthetic multi-session labeled frame data with a known yaw-dependent target.
 def synthetic_sessions(n_sessions=4, n=600, seed=0):
-    """Eye feature + head yaw -> screen position, with a yaw-dependent shift
-    (the 'head angle changes the mapping' effect) the model must learn."""
     from doomscroll.ml.dataset import LabeledFrames
 
     rng = np.random.default_rng(seed)
@@ -161,11 +167,12 @@ def synthetic_sessions(n_sessions=4, n=600, seed=0):
     return out
 
 
+# Checks training on pooled synthetic sessions learns and the saved model round-trips.
 def test_training_learns_and_saves(tmp_path):
     data = pool(synthetic_sessions())
     assert data.cv_kind == "leave-sessions-out"
     report = evaluate_candidates(data, ["ridge"])
-    assert report["ridge"]["mean_px"] < 60  # screen is 1000px wide; chance is ~400
+    assert report["ridge"]["mean_px"] < 60
     assert report["ridge"]["by_yaw"]
 
     model = TrainedGazeModel(fit_final("ridge", data), {"kind": "ridge"})
@@ -175,18 +182,21 @@ def test_training_learns_and_saves(tmp_path):
     np.testing.assert_allclose(loaded.predict_px(x, SCREEN), model.predict_px(x, SCREEN))
 
 
+# Checks a single long session falls back to time-block cross-validation.
 def test_few_sessions_fall_back_to_time_blocks():
     data = pool(synthetic_sessions(n_sessions=1, n=1500))
     assert "time blocks" in data.cv_kind
     assert evaluate_candidates(data, ["ridge"])["ridge"]["mean_px"] < 60
 
 
+# Checks every training candidate model fits and predicts the expected shape.
 def test_all_candidates_fit():
     data = pool(synthetic_sessions(n_sessions=3, n=200))
     for name in CANDIDATES:
         assert fit_final(name, data).predict(data.X[:3]).shape == (3, 2)
 
 
+# Checks loading a model saved with different feature names raises an error.
 def test_model_rejects_changed_features(tmp_path):
     import joblib
 
@@ -195,18 +205,20 @@ def test_model_rejects_changed_features(tmp_path):
         TrainedGazeModel.load(tmp_path / "old.joblib")
 
 
+# Checks AffineCorrection removes a known bias and stays safe with too few points.
 def test_affine_correction_fixes_bias_and_stays_safe_with_few_points():
     rng = np.random.default_rng(1)
     truth = rng.uniform(0.1, 0.9, (9, 2))
-    biased = truth * 0.9 + 0.05  # the shared model is shrunk + shifted for this user
+    biased = truth * 0.9 + 0.05
     fixed = AffineCorrection.fit(biased, truth, shrink=0.01)
     err_before = np.abs(biased - truth).mean()
     err_after = np.abs(np.array([fixed.apply(p) for p in biased]) - truth).mean()
     assert err_after < err_before / 5
-    ident = AffineCorrection.fit(np.empty((0, 2)), np.empty((0, 2)))  # no data -> identity, no crash
+    ident = AffineCorrection.fit(np.empty((0, 2)), np.empty((0, 2)))
     np.testing.assert_allclose(ident.apply(np.array([0.3, 0.7])), [0.3, 0.7])
 
 
+# Checks extract_features returns the expected shape and known values in order.
 def test_extract_features_shape_and_order():
     from doomscroll.gaze.head_pose import HeadPose
     from doomscroll.ml.features import extract_features
@@ -219,6 +231,7 @@ def test_extract_features_shape_and_order():
     assert f[FEATURE_NAMES.index("head_tz")] == 600.0
 
 
+# Checks fit_user_correction's leave-one-out error is much better than before correction.
 def test_fit_user_correction_reports_loo():
     from doomscroll.ml.model import fit_user_correction
 
@@ -229,6 +242,7 @@ def test_fit_user_correction_reports_loo():
     assert after < before / 3
 
 
+# Checks leave-person-out pooling never tests on a person seen in training.
 def test_leave_person_out_never_tests_on_a_training_person():
     from dataclasses import replace
 
@@ -243,10 +257,10 @@ def test_leave_person_out_never_tests_on_a_training_person():
         assert not set(data.participant[train]) & set(data.participant[test])
     report = evaluate_candidates(data, ["ridge"])
     assert [p for p, _, _ in report["ridge"]["by_person"]] == ["anni", "bo", "cy"]
-    # default is unchanged: sessions are the groups
     assert pool(sessions).cv_kind == "leave-sessions-out"
 
 
+# Checks leave-person-out pooling requires at least two participants.
 def test_leave_person_out_needs_two_people():
     from dataclasses import replace
 

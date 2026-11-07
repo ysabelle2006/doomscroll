@@ -1,17 +1,4 @@
-"""Tests for doomscroll.gaze.calibration: the Ridge regression that maps a
-(eye-in-head + head-pose) feature vector to a screen position, and whose
-accuracy is what calibrate.py ultimately reports at the end of a real
-session.
-
-Covers two things:
-  1. Ordinary unit tests of GazeCalibrator's API contract (minimum sample
-     count, fit-before-predict, save/load round-trip).
-  2. test_calibration_accuracy_regression_benchmark -- a synthetic,
-     fully-reproducible "did my change to calibration.py help or hurt"
-     check, using a known ground-truth mapping (see synthetic_calibration.py)
-     instead of a real human calibration session. A hard pytest fail here
-     means something broke badly.
-"""
+# Tests for GazeCalibrator fitting/prediction/persistence and accuracy benchmarks.
 from __future__ import annotations
 
 from pathlib import Path
@@ -31,16 +18,11 @@ from tests.synthetic_calibration import (
     generate_synthetic_session,
 )
 
-# A healthy GazeCalibrator fit on generate_synthetic_session(seed=0) lands
-# at ~10-12px mean validation error across reruns (see the commented values
-# this was calibrated against). This threshold is deliberately generous --
-# several times that -- so ordinary seed-to-seed/version-to-version noise
-# never fails the build; it exists to catch a real regression (e.g. the
-# alpha search reaching for far more regularization than it should, which
-# empirically pushes this same benchmark's error past 200px).
+# Error budget for the regression benchmark against a synthetic session.
 MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX = 40.0
 
 
+# Checks build_feature_vector concatenates gaze/pose/translation in order.
 def test_build_feature_vector_concatenates_in_order():
     feature = build_feature_vector(
         gaze_vector=np.array([0.1, 0.2, 0.3, 0.4]),
@@ -51,6 +33,7 @@ def test_build_feature_vector_concatenates_in_order():
     np.testing.assert_allclose(feature, [0.1, 0.2, 0.3, 0.4, 5.0, -6.0, 7.0, 10.0, 20.0, 300.0])
 
 
+# Checks fit() rejects fewer than the minimum required samples.
 def test_fit_rejects_too_few_samples():
     too_few = MIN_CALIBRATION_SAMPLES - 1
     features = np.zeros((too_few, FEATURE_DIM))
@@ -60,33 +43,29 @@ def test_fit_rejects_too_few_samples():
         calibrator.fit(features, targets)
 
 
+# Checks predict() before fit() raises.
 def test_predict_before_fit_raises():
     calibrator = GazeCalibrator()
     with pytest.raises(RuntimeError):
         calibrator.predict(np.zeros(FEATURE_DIM))
 
 
+# Checks selected_alpha before fit() raises.
 def test_selected_alpha_before_fit_raises():
     calibrator = GazeCalibrator()
     with pytest.raises(RuntimeError):
         _ = calibrator.selected_alpha
 
 
+# Checks validate() before fit() raises.
 def test_validate_before_fit_raises():
-    """validate() delegates to predict() per sample (so local correction
-    applies during validation too), so it raises the same clear
-    RuntimeError as predict()/selected_alpha rather than leaking sklearn's
-    internal NotFittedError."""
     calibrator = GazeCalibrator()
     with pytest.raises(RuntimeError):
         calibrator.validate(np.zeros((1, FEATURE_DIM)), np.zeros((1, 2)))
 
 
+# Checks fit/predict recovers a simple known linear mapping.
 def test_fit_predict_recovers_a_simple_known_mapping():
-    """Sanity check on the API with the simplest possible case: a mapping
-    where screen position is *exactly* 1000x the first feature dimension,
-    nothing else -- predict() on a held-out point near the training range
-    should recover it closely."""
     rng = np.random.default_rng(42)
     n_points = 16
     samples_per_point = 15
@@ -110,6 +89,7 @@ def test_fit_predict_recovers_a_simple_known_mapping():
     assert prediction[1] == pytest.approx(500.0, abs=15.0)
 
 
+# Checks save/load round-trips a fitted calibrator's predictions unchanged.
 def test_save_load_round_trip_preserves_predictions(tmp_path: Path):
     sess = generate_synthetic_session(seed=1)
     calibrator = GazeCalibrator()
@@ -127,14 +107,14 @@ def test_save_load_round_trip_preserves_predictions(tmp_path: Path):
     np.testing.assert_allclose(after, before)
 
 
+# Checks loading a missing profile path raises FileNotFoundError.
 def test_load_missing_profile_raises():
     with pytest.raises(FileNotFoundError):
         GazeCalibrator.load("/nonexistent/path/does-not-exist.joblib")
 
 
+# Regression benchmark: checks mean validation error stays below budget on synthetic data.
 def test_calibration_accuracy_regression_benchmark():
-    """The main 'did a change to calibration.py help or hurt' check -- see
-    module docstring and MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX above."""
     sess = generate_synthetic_session(seed=0)
     calibrator = GazeCalibrator()
     calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
@@ -149,14 +129,8 @@ def test_calibration_accuracy_regression_benchmark():
     )
 
 
+# Checks local correction reduces error versus the uncorrected baseline on nonlinear data.
 def test_local_correction_reduces_error_on_the_nonlinear_synthetic_benchmark():
-    """synthetic_calibration.py deliberately bakes in a small cubic
-    nonlinearity the degree-1 global model can't fit (see its module
-    docstring on _NONLINEARITY_COEF) -- exactly the regime the local KNN
-    residual correction exists for. Comparing against
-    local_correction_max_weight=0.0 (which makes _local_correction always
-    return zero) isolates its effect from everything else GazeCalibrator
-    does."""
     sess = generate_synthetic_session(seed=0)
 
     baseline = GazeCalibrator(local_correction_max_weight=0.0)
@@ -170,10 +144,8 @@ def test_local_correction_reduces_error_on_the_nonlinear_synthetic_benchmark():
     assert corrected_err < baseline_err
 
 
+# Checks local correction is zero for a feature far from any training sample.
 def test_local_correction_is_zero_far_from_any_training_sample():
-    """A live input far outside anything seen during calibration shouldn't
-    get nudged by nearby-but-irrelevant residuals -- it should fall back to
-    the pure global prediction, same as if local correction were absent."""
     sess = generate_synthetic_session(seed=2)
     calibrator = GazeCalibrator()
     calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
@@ -183,11 +155,8 @@ def test_local_correction_is_zero_far_from_any_training_sample():
     np.testing.assert_allclose(calibrator._local_correction(X_far), np.zeros(2))
 
 
+# Checks local correction state survives a save/load round trip.
 def test_local_correction_survives_save_load_round_trip(tmp_path: Path):
-    """save()/load() must round-trip the local-correction training data
-    too, not just the ridge models -- otherwise a freshly-loaded calibrator
-    would silently lose the correction and predict differently than it did
-    right before saving."""
     sess = generate_synthetic_session(seed=0)
     calibrator = GazeCalibrator()
     calibrator.fit(sess.train_features, sess.train_targets, groups=sess.train_groups)
@@ -202,26 +171,12 @@ def test_local_correction_survives_save_load_round_trip(tmp_path: Path):
     np.testing.assert_allclose(after, before)
 
 
-# The pursuit protocol has an intentionally modeled, *higher* error floor
-# than MAX_ACCEPTABLE_SYNTHETIC_ERROR_PX: it bakes in a systematic
-# lag/undershoot mismatch between where the eye physically is and what the
-# recorded label claims (see synthetic_calibration.py's module docstring on
-# PURSUIT_LATENCY_S / PURSUIT_GAIN). That's the whole point of the model,
-# not a bug -- empirically this lands around 55-70px across seeds, vs.
-# ~10-12px for the still-point grid. This threshold (~2x the observed max)
-# exists only to catch a genuinely broken fit, not to compare protocols
-# against each other.
+# Error budget for the pursuit-protocol synthetic benchmark.
 MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX = 120.0
 
 
+# Checks a pursuit-protocol session fits and validates without error, within budget.
 def test_pursuit_session_fits_and_validates_without_error():
-    """Sanity check for the cursor-pursuit protocol generator (see
-    synthetic_calibration.py) -- this is deliberately NOT asserting pursuit
-    is better or worse than the still-point grid (that remains an open,
-    unautomated empirical question); it just confirms the pursuit-shaped
-    dataset is well-formed and GazeCalibrator can fit/validate against it
-    without error, within its own (higher, intentionally-modeled) error
-    floor -- see MAX_ACCEPTABLE_PURSUIT_SYNTHETIC_ERROR_PX above."""
     sess = generate_pursuit_session(seed=0)
     assert sess.train_features.shape[1] == FEATURE_DIM
     assert sess.train_features.shape[0] == sess.train_targets.shape[0] == sess.train_groups.shape[0]
@@ -237,11 +192,8 @@ def test_pursuit_session_fits_and_validates_without_error():
     )
 
 
+# Checks the protocol-comparison session's still/pursuit/val arrays have consistent shapes.
 def test_protocol_comparison_session_shapes_are_consistent():
-    """Shape/wiring sanity check for generate_protocol_comparison_session():
-    both training sets use the real FEATURE_DIM layout, each has matching
-    feature/target/group counts, and the validation set (shared by both
-    protocols, by construction) is internally consistent."""
     session = generate_protocol_comparison_session(seed=0)
 
     assert session.still_train_features.shape[1] == FEATURE_DIM

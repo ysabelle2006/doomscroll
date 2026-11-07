@@ -1,22 +1,6 @@
-"""Appearance-based gaze CNN (PyTorch): eye crops + face crop + landmark features -> screen point.
+# CNN gaze model: eye/face conv towers + aux features, training,
+# cross-validation, and inference.
 
-Architecture (iTracker-style, sized for a webcam + one laptop):
-
-    left eye  36x60 ─┐ shared conv tower ─> 128 ─┐
-    right eye 36x60 ─┘                    ─> 128 ─┤
-    face      64x64 ── small conv tower   ─>  64 ─┼─ FC 128 ─ FC 2  -> screen fraction (x, y)
-    11 landmark features (head pose, head position, iris offsets) ─> 32 ─┘
-
-The landmark features are the same ones the sklearn models use (ml/features.py),
-so the CNN starts from everything they know and only has to learn what the
-pixels add (eyelid shape, iris detail that MediaPipe's iris points blur).
-Both eyes go through the SAME conv weights (twice the data per filter); their
-outputs are concatenated in a fixed order, so the FC layers still know which is which.
-
-Evaluation follows ml/training.py exactly: whole sessions held out (whole
-participants with group_by="person"; 20 s time blocks with < 3 sessions), never random frames. Early stopping uses the LAST 10%
-of each TRAINING session, so the held-out session is never looked at while training.
-"""
 from __future__ import annotations
 
 import math
@@ -36,22 +20,22 @@ from doomscroll.ml.model import CLAMP_FRAC, AffineCorrection
 DEFAULT_CNN_PATH = Path(__file__).resolve().parents[3] / "models" / "gaze_cnn.pt"
 
 
-# --------------------------------------------------------------------------- model
 
+# One conv + batchnorm + ReLU block.
 def _conv(cin: int, cout: int) -> nn.Sequential:
     return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
 
 
+# Conv tower that encodes one eye crop into a feature vector.
 class EyeTower(nn.Module):
-    """36x60 -> 128."""
 
     def __init__(self, width: int = 32):
         super().__init__()
         w = width
         self.body = nn.Sequential(
-            _conv(1, w), _conv(w, w), nn.MaxPool2d(2),            # 18x30
-            _conv(w, 2 * w), _conv(2 * w, 2 * w), nn.MaxPool2d(2),  # 9x15
-            _conv(2 * w, 4 * w), _conv(4 * w, 4 * w), nn.MaxPool2d(2),  # 4x7
+            _conv(1, w), _conv(w, w), nn.MaxPool2d(2),
+            _conv(w, 2 * w), _conv(2 * w, 2 * w), nn.MaxPool2d(2),
+            _conv(2 * w, 4 * w), _conv(4 * w, 4 * w), nn.MaxPool2d(2),
         )
         self.fc = nn.Sequential(nn.Flatten(), nn.Dropout(0.2), nn.Linear(4 * w * 4 * 7, 128), nn.ReLU(inplace=True))
 
@@ -59,16 +43,16 @@ class EyeTower(nn.Module):
         return self.fc(self.body(x))
 
 
+# Conv tower that encodes the face crop into a feature vector.
 class FaceTower(nn.Module):
-    """64x64 -> 64."""
 
     def __init__(self, width: int = 16):
         super().__init__()
         w = width
         self.body = nn.Sequential(
-            _conv(1, w), nn.MaxPool2d(2),          # 32
-            _conv(w, 2 * w), nn.MaxPool2d(2),      # 16
-            _conv(2 * w, 4 * w), nn.MaxPool2d(2),  # 8
+            _conv(1, w), nn.MaxPool2d(2),
+            _conv(w, 2 * w), nn.MaxPool2d(2),
+            _conv(2 * w, 4 * w), nn.MaxPool2d(2),
             _conv(4 * w, 4 * w), nn.AdaptiveAvgPool2d(4),
         )
         self.fc = nn.Sequential(nn.Flatten(), nn.Linear(4 * w * 16, 64), nn.ReLU(inplace=True))
@@ -77,6 +61,7 @@ class FaceTower(nn.Module):
         return self.fc(self.body(x))
 
 
+# Combines eye, face, and auxiliary-feature towers into a gaze-point predictor.
 class GazeNet(nn.Module):
     def __init__(self, use_face: bool = True, use_aux: bool = True, eye_width: int = 32):
         super().__init__()
@@ -86,12 +71,11 @@ class GazeNet(nn.Module):
         self.aux = nn.Sequential(nn.Linear(FEATURE_DIM, 32), nn.ReLU(inplace=True)) if use_aux else None
         d = 2 * 128 + (64 if use_face else 0) + (32 if use_aux else 0)
         self.head = nn.Sequential(nn.Linear(d, 128), nn.ReLU(inplace=True), nn.Dropout(0.2), nn.Linear(128, 2))
-        with torch.no_grad():  # start predicting the screen centre, not a random corner
+        with torch.no_grad():
             self.head[-1].weight.mul_(0.1)
             self.head[-1].bias.fill_(0.5)
 
     def forward(self, eyes, face, aux):
-        """eyes (B,2,H,W), face (B,1,S,S), aux (B,FEATURE_DIM); all float, already normalized."""
         parts = [self.eye(eyes[:, 0:1]), self.eye(eyes[:, 1:2])]
         if self.use_face:
             parts.append(self.face(face))
@@ -100,17 +84,14 @@ class GazeNet(nn.Module):
         return self.head(torch.cat(parts, dim=1))
 
 
-# ------------------------------------------------------------------ tensors & augment
 
+# Normalizes a uint8 image tensor to roughly zero-mean unit-variance.
 def _img(u8: torch.Tensor) -> torch.Tensor:
-    """uint8 -> float, roughly zero-mean unit-ish range (crops are hist-equalized)."""
     return (u8.float() / 255.0 - 0.5) / 0.29
 
 
+# Applies random shift/rotation/scale/contrast/brightness/noise augmentation to a batch of images.
 def _augment_imgs(x: torch.Tensor, max_shift_px: float, max_rot_deg: float, max_scale: float) -> torch.Tensor:
-    """x (B,C,H,W) float. Small random affine per sample (mimics landmark jitter, so the
-    net doesn't trust exact iris-in-crop placement more than it should at runtime)
-    + brightness/contrast + noise."""
     b, _, h, w = x.shape
     dev = x.device
     ang = (torch.rand(b, device=dev) * 2 - 1) * math.radians(max_rot_deg)
@@ -126,21 +107,22 @@ def _augment_imgs(x: torch.Tensor, max_shift_px: float, max_rot_deg: float, max_
     return x * contrast + bright + torch.randn_like(x) * 0.05
 
 
+# Pooled eye/face/aux arrays plus targets and cross-validation grouping, for CNN training.
 @dataclass
 class Arrays:
-    """Pooled training rows (CPU numpy). Images stay uint8 until a batch is drawn."""
 
-    eyes: np.ndarray       # (N,2,H,W) uint8
-    face: np.ndarray       # (N,S,S) uint8
-    aux: np.ndarray        # (N,FEATURE_DIM) float32, raw (unnormalized)
-    y: np.ndarray          # (N,2) screen fractions
-    screen_wh: np.ndarray  # (N,2)
-    groups: np.ndarray     # (N,) test-fold group (session id or session#block)
-    session: np.ndarray    # (N,) session id
-    t_ms: np.ndarray       # (N,)
-    participant: np.ndarray  # (N,) who was recorded
+    eyes: np.ndarray
+    face: np.ndarray
+    aux: np.ndarray
+    y: np.ndarray
+    screen_wh: np.ndarray
+    groups: np.ndarray
+    session: np.ndarray
+    t_ms: np.ndarray
+    participant: np.ndarray
     cv_kind: str = ""
 
+    # Returns a copy of this Arrays indexed by idx.
     def take(self, idx: np.ndarray) -> "Arrays":
         return Arrays(self.eyes[idx], self.face[idx], self.aux[idx], self.y[idx], self.screen_wh[idx],
                       self.groups[idx], self.session[idx], self.t_ms[idx], self.participant[idx], self.cv_kind)
@@ -149,8 +131,8 @@ class Arrays:
         return len(self.y)
 
 
+# Pools crop sessions into one Arrays dataset, grouped by session or by participant.
 def pool_crops(sessions, lag_ms=0.0, window_ms=600.0, min_travel_px=40.0, group_by: str = "session") -> Arrays:
-    """group_by: "session" (default) or "person" (hold out every session of one participant at a time)."""
     from doomscroll.ml.training import BLOCK_S, MIN_SESSIONS_FOR_SESSION_CV
 
     parts = []
@@ -190,9 +172,8 @@ def pool_crops(sessions, lag_ms=0.0, window_ms=600.0, min_travel_px=40.0, group_
                   np.concatenate(ts), np.concatenate(who), kind)
 
 
+# Splits each session's frames into train/val by holding out its final time fraction.
 def tail_split(data: Arrays, frac: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
-    """Inner validation = the last `frac` (by time) of every session in `data`.
-    Contiguous, so it is not a near-duplicate of the training frames."""
     val = np.zeros(len(data), bool)
     for sid in np.unique(data.session):
         m = np.flatnonzero(data.session == sid)
@@ -201,8 +182,8 @@ def tail_split(data: Arrays, frac: float = 0.1) -> tuple[np.ndarray, np.ndarray]
     return np.flatnonzero(~val), np.flatnonzero(val)
 
 
-# ------------------------------------------------------------------------ training
 
+# Hyperparameters for train_net().
 @dataclass
 class TrainConfig:
     epochs: int = 25
@@ -216,9 +197,9 @@ class TrainConfig:
     max_shift_px: float = 2.0
     max_rot_deg: float = 4.0
     max_scale: float = 0.05
-    aux_noise: float = 0.05     # in standardized units
-    train_stride: int = 1       # use every n-th training frame (near-duplicates anyway)
-    patience: int = 6           # stop if inner-val error hasn't improved for this many epochs
+    aux_noise: float = 0.05
+    train_stride: int = 1
+    patience: int = 6
     seed: int = 0
     device: str = "auto"
 
@@ -226,6 +207,7 @@ class TrainConfig:
         return dict(self.__dict__)
 
 
+# Picks the torch device to train/run on (cuda > mps > cpu, or an explicit choice).
 def pick_device(name: str = "auto") -> torch.device:
     if name != "auto":
         return torch.device(name)
@@ -236,6 +218,7 @@ def pick_device(name: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
+# Per-feature mean/std normalizer fit on training data.
 @dataclass
 class Normalizer:
     mean: np.ndarray
@@ -249,12 +232,14 @@ class Normalizer:
         return ((aux - self.mean) / self.std).astype(np.float32)
 
 
+# Yields batches of indices, shuffled if requested.
 def _batches(n: int, bs: int, shuffle: bool, rng: np.random.Generator):
     idx = rng.permutation(n) if shuffle else np.arange(n)
     for i in range(0, n, bs):
         yield idx[i:i + bs]
 
 
+# Moves one batch's eyes/face/aux arrays to the given device as normalized tensors.
 def _to_device(data: Arrays, idx: np.ndarray, norm: Normalizer, dev: torch.device):
     eyes = _img(torch.from_numpy(data.eyes[idx]).to(dev))
     face = _img(torch.from_numpy(data.face[idx]).to(dev)).unsqueeze(1)
@@ -263,6 +248,7 @@ def _to_device(data: Arrays, idx: np.ndarray, norm: Normalizer, dev: torch.devic
 
 
 @torch.no_grad()
+# Runs the network over a whole Arrays dataset in batches, returning predictions.
 def predict_arrays(net: GazeNet, data: Arrays, norm: Normalizer, dev: torch.device, bs: int = 512) -> np.ndarray:
     net.eval()
     out = []
@@ -271,12 +257,13 @@ def predict_arrays(net: GazeNet, data: Arrays, norm: Normalizer, dev: torch.devi
     return np.concatenate(out) if out else np.zeros((0, 2), np.float32)
 
 
+# Converts fraction-space predictions to pixel distance errors.
 def px_errors(pred: np.ndarray, data: Arrays) -> np.ndarray:
     return np.linalg.norm((pred - data.y) * data.screen_wh, axis=1)
 
 
+# Trains GazeNet with early stopping on validation error; returns the best epoch's weights.
 def train_net(train: Arrays, val: Arrays | None, cfg: TrainConfig, log=print) -> tuple[GazeNet, Normalizer, dict]:
-    """Train one network. If `val` is given, keep the epoch with the lowest val px error."""
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
     dev = pick_device(cfg.device)
@@ -287,7 +274,7 @@ def train_net(train: Arrays, val: Arrays | None, cfg: TrainConfig, log=print) ->
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps = cfg.epochs * math.ceil(len(train) / cfg.batch_size)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg.lr, total_steps=max(steps, 1), pct_start=0.15)
-    px_scale = torch.tensor([1000.0], device=dev)  # loss in units of ~1000 px -> Huber knee ~= 100 px
+    px_scale = torch.tensor([1000.0], device=dev)
 
     best = {"val_px": float("inf"), "epoch": -1, "state": None}
     history = []
@@ -327,8 +314,8 @@ def train_net(train: Arrays, val: Arrays | None, cfg: TrainConfig, log=print) ->
     return net, norm, {"history": history, "best_epoch": best["epoch"], "best_val_px": best["val_px"]}
 
 
+# Cross-validates train_net() across group folds, returning out-of-fold predictions.
 def cross_validate(data: Arrays, cfg: TrainConfig, max_folds: int = 5, log=print) -> np.ndarray:
-    """Out-of-fold predictions for every row, held out by group (see module doc)."""
     from sklearn.model_selection import GroupKFold
 
     n_groups = len(np.unique(data.groups))
@@ -353,8 +340,8 @@ def cross_validate(data: Arrays, cfg: TrainConfig, max_folds: int = 5, log=print
     return pred
 
 
+# Cross-validates the ridge/hgb baselines on the same folds, for comparison.
 def baseline_oof(data: Arrays, names=("ridge", "hgb"), max_folds: int = 5) -> dict[str, np.ndarray]:
-    """The sklearn landmark models on EXACTLY the same rows and folds, for a fair comparison."""
     from sklearn.model_selection import GroupKFold
 
     from doomscroll.ml.training import CANDIDATES
@@ -371,12 +358,9 @@ def baseline_oof(data: Arrays, names=("ridge", "hgb"), max_folds: int = 5) -> di
     return out
 
 
-# --------------------------------------------------------------------- saved model
 
+# A trained CNN model plus its normalizer and optional per-user correction, ready for inference.
 class CnnGazeModel:
-    """Live-inference wrapper with the same shape as ml.model.TrainedGazeModel:
-    predict_px(points_px, pose, gray, screen_wh). Runs on CPU by default (one frame
-    at a time is faster on CPU than paying the MPS/GPU transfer cost)."""
 
     def __init__(self, net: GazeNet, norm: Normalizer, metadata: dict, correction: AffineCorrection | None = None,
                  device: str = "cpu"):
@@ -386,6 +370,7 @@ class CnnGazeModel:
         self.metadata = metadata
         self.correction = correction
 
+    # Predicts a screen-fraction point from one frame's landmarks/pose/image.
     @torch.no_grad()
     def predict_frac(self, points_px: np.ndarray, pose, gray: np.ndarray) -> np.ndarray:
         feats = extract_features(points_px, pose, gray).astype(np.float32)[None]
@@ -398,11 +383,12 @@ class CnnGazeModel:
             frac = self.correction.apply(frac)
         return np.clip(frac, *CLAMP_FRAC)
 
-    predict_frac_frame = predict_frac  # same name as TrainedGazeModel's (see ml.model.load_gaze_model)
+    predict_frac_frame = predict_frac
 
     def predict_px(self, points_px, pose, gray, screen_wh: tuple[int, int]) -> np.ndarray:
         return self.predict_frac(points_px, pose, gray) * np.array(screen_wh, dtype=np.float64)
 
+    # Saves the model's weights, normalizer, and metadata to disk.
     def save(self, path: Path | str = DEFAULT_CNN_PATH) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +400,7 @@ class CnnGazeModel:
             "feature_names": list(FEATURE_NAMES), "crop_spec": CROP_SPEC, "metadata": self.metadata,
         }, path)
 
+    # Loads a saved CNN model, plus a correction if one exists at correction_path.
     @classmethod
     def load(cls, path: Path | str = DEFAULT_CNN_PATH, correction_path: Path | str | None = None,
              device: str = "cpu") -> "CnnGazeModel":

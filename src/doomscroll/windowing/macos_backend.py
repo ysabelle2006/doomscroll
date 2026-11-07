@@ -1,7 +1,4 @@
-"""macOS focused-window-bounds via Quartz. Requires Screen Recording and
-Accessibility permissions granted to the running process (System Settings ->
-Privacy & Security). Not exercised on the Windows dev machine — validate on
-macOS before relying on it."""
+# macOS implementation of WindowBoundsProvider using AppKit/Quartz.
 from __future__ import annotations
 
 import os
@@ -11,6 +8,8 @@ from doomscroll.windowing.base import WindowBounds, WindowBoundsProvider
 try:
     from AppKit import NSWorkspace
     from Quartz import (
+        CGDisplayBounds,
+        CGMainDisplayID,
         CGWindowListCopyWindowInfo,
         kCGNullWindowID,
         kCGWindowListOptionOnScreenOnly,
@@ -21,7 +20,9 @@ except ImportError:
     _QUARTZ_AVAILABLE = False
 
 
+# Reports the frontmost app window's bounds via AppKit/Quartz.
 class MacOSWindowBoundsProvider(WindowBoundsProvider):
+    # Raises if the pyobjc AppKit/Quartz frameworks are not installed.
     def __init__(self):
         if not _QUARTZ_AVAILABLE:
             raise RuntimeError(
@@ -31,6 +32,7 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
                 "re-running that."
             )
 
+    # Finds the frontmost app's on-screen window, falling back to the main display.
     def get_focused_window_bounds(self) -> WindowBounds | None:
         frontmost_app = NSWorkspace.sharedWorkspace().frontmostApplication()
         if frontmost_app is None:
@@ -38,15 +40,6 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
         frontmost_pid = frontmost_app.processIdentifier()
 
         if frontmost_pid == os.getpid():
-            # This very process (the gaze-tracking script itself -- its
-            # webcam preview window, most likely) is the frontmost
-            # application. Reporting one of our own windows back as "the
-            # focused window" would mean OCR, the live overlay, and the
-            # scroll trigger all start reasoning about our own debug
-            # window instead of whatever the user is actually reading.
-            # Report "no focused window" instead, so callers fall back to
-            # whatever external window was last genuinely focused.
-            #
             return None
 
         window_list = CGWindowListCopyWindowInfo(
@@ -67,4 +60,12 @@ class MacOSWindowBoundsProvider(WindowBoundsProvider):
                 height=int(bounds["Height"]),
                 app_name=window.get("kCGWindowOwnerName", "unknown"),
             )
-        return None
+
+        main_bounds = CGDisplayBounds(CGMainDisplayID())
+        return WindowBounds(
+            x=int(main_bounds.origin.x),
+            y=int(main_bounds.origin.y),
+            width=int(main_bounds.size.width),
+            height=int(main_bounds.size.height),
+            app_name=str(frontmost_app.localizedName() or "desktop"),
+        )

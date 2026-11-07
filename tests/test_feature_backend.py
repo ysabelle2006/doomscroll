@@ -1,9 +1,4 @@
-"""Tests for doomscroll.gaze.feature_backend: the gaze-vector-pipeline
-dispatch used by scripts/calibrate.py and scripts/phase2_gaze_scroll.py.
-
-HandcraftedGazeExtractor is the only backend and is pure/fast, so it's
-tested directly.
-"""
+# Tests for the handcrafted gaze feature extractor and its factory function.
 from __future__ import annotations
 
 import numpy as np
@@ -15,26 +10,24 @@ from doomscroll.gaze.feature_backend import (
 from doomscroll.gaze.gaze_vector import compute_gaze_feature
 
 
+# Builds synthetic landmark points for a simple two-eye layout.
 def _four_point_eyes() -> np.ndarray:
-    """Minimal 478-point-shaped array with just the eye/iris landmarks
-    gaze_vector.py actually reads populated, matching how
-    test_gaze_vector.py builds its own fixtures."""
     points = np.zeros((478, 2), dtype=np.float64)
-    # left eye: outer=33, inner=133, iris center=468
     points[33] = [100.0, 100.0]
     points[133] = [120.0, 100.0]
     points[468] = [112.0, 100.0]
-    # right eye: outer=263, inner=362, iris center=473
     points[263] = [220.0, 100.0]
     points[362] = [200.0, 100.0]
     points[473] = [208.0, 100.0]
     return points
 
 
+# Checks the extractor reports its name as "handcrafted".
 def test_handcrafted_extractor_name():
     assert HandcraftedGazeExtractor().name == "handcrafted"
 
 
+# Checks the extractor's output matches compute_gaze_feature called directly.
 def test_handcrafted_extractor_matches_compute_gaze_feature_directly():
     points_px = _four_point_eyes()
     frame_gray = np.zeros((480, 640), dtype=np.uint8)
@@ -48,6 +41,7 @@ def test_handcrafted_extractor_matches_compute_gaze_feature_directly():
     assert vector.shape == (4,)
 
 
+# Checks the factory returns a HandcraftedGazeExtractor instance.
 def test_make_gaze_extractor_returns_handcrafted_instance():
     extractor = make_gaze_extractor()
     assert isinstance(extractor, HandcraftedGazeExtractor)

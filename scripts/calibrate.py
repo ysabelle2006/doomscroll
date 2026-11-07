@@ -1,98 +1,6 @@
-"""Phase 2: gaze calibration, plus a head-pose variation pass.
+# Math-model gaze calibration (GazeCalibrator): dot-grid or trajectory
+# protocol, plus a shared head-pose variation pass and validation.
 
-Two protocols are available, selected by --protocol (see main() and the
-"Protocol dispatch" section):
-
-  - --protocol dots uses the point-by-point dot-grid protocol
-    (run_sequence()/collect_samples_for_point()): you look at each dot in
-    turn, head still and forward, for a fixed capture window per point.
-    It needs nothing beyond mouse clicks to start each pass; no mouse
-    TRACKING during capture.
-  - --protocol trajectory (default) uses a continuous, programmed
-    anchor+raster dot path instead of discrete dots (see gaze/trajectory.py
-    and run_trajectory_capture() below) -- the dot moves on its own; you
-    just follow it with your eyes. Fits the same GazeCalibrator directly on
-    ~1000+ continuously-captured frames rather than a handful of per-dot
-    samples. An alternative capture method to the dot-grid protocol --
-    judge which works better empirically on your own setup (both save to
-    the same profile, so switching between them costs nothing but a
-    recalibration).
-
-Both protocols share the same wait_for_front_ready()/wait_for_pose_ready()
-readiness screens, the same six-variant head-pose pass (each protocol
-using its own capture mechanic for it), and the same fit/validate/save
-tail end in main() -- only the actual capture mechanic differs.
-
-Before anything starts, a live readiness screen (wait_for_front_ready())
-shows the camera feed plus a live in-frame/out-of-frame readout and your
-current yaw/pitch/distance, so you have a concrete reference point for
-"this is normally how far/centered I sit" before committing to it for the
-whole session.
-
---- Dot-grid protocol (--protocol dots) ---
-
-Main pass: a 4x4 grid (16 points, see TRAIN_GRID_FRACTIONS). Keep your head
-facing forward, roughly toward the center of the screen, and use ONLY your
-eyes to look at each dot as it appears -- don't turn your head toward it.
-Each point gets a brief settle window then a fixed capture window (SETTLE_S
-/ CAPTURE_S). A held-out 5-point set (VALIDATION_FRACTIONS) is used for the
-validation pass afterward.
-
-Head-pose variation pass: the same discrete-dot mechanic, at a reduced
-5-point set (POSE_VARIATION_FRACTIONS) per variant -- see the shared
-"Head-pose variation pass" section below for why this pass exists at all.
-
---- Continuous trajectory protocol (--protocol trajectory) ---
-
-Main pass: a single dot sweeps the whole screen on its own in a programmed
-path -- first a handful of anchor points (corners, edges, center), each
-with a brief dwell, then a boustrophedon raster sweep covering the rest of
-the screen (see gaze/trajectory.py's ANCHOR_FRACTIONS/build_waypoints()).
-You never move anything yourself; you just watch the dot and let your eyes
-follow it. Every frame during the sweep is a candidate sample (not just a
-per-dot aggregate), labeled with the dot's own programmed position at a
-fixed lag before capture time (see TRAJECTORY_LAG_MS) to correct for
-smooth-pursuit lag. Frames shortly after a sharp direction change or an
-anchor arrival are discarded (see gaze/trajectory.turn_discard_mask()),
-and the dot pauses (gaze/trajectory.TURN_PAUSE_MS) before any sharp
-direction change too.
-
-Head-pose variation pass: a shorter, anchor-free run of the same raster
-sweep (see _short_trajectory_waypoints()) per variant -- see the shared
-"Head-pose variation pass" section below for why this pass exists at all.
-
-A validation pass follows afterward too, using the same short anchor-free
-raster, reporting mean pixel error.
-
---- Head-pose variation pass (shared, both protocols) ---
-
-Immediately after the main pass, you'll be asked to hold your head in a
-few different natural positions -- lean LEFT, lean RIGHT, lean CLOSER
-(forward), sit BACK (backward), tilt UP, tilt DOWN -- while capturing a
-shorter version of whichever protocol's own mechanic (see above). The main
-pass alone gives the model almost no variation in head rotation or
-position to learn from (you're asked to stay forward throughout), so at
-runtime, real head movement lands outside anything the model ever saw and
-the mapping degrades badly. This pass gives the same kind of data under
-genuinely different head positions, which is what lets the model learn to
-correct for head motion instead of just extrapolating blindly.
-
-Each pose-variant transition is self-paced: it shows the live camera feed
-plus a readout (yaw/pitch/camera-distance, whichever that variant actually
-depends on) and waits for you to press SPACE once you're actually holding
-the position and still visibly in frame -- see wait_for_pose_ready().
-People take a different amount of time to find and hold an off-center pose;
-a fixed timer either wastes time once you're already there, or starts
-capturing before someone who needed longer has actually arrived.
-
-Raw per-session samples are always saved afterward (see session_store.py),
-so later runs can optionally pool recent sessions together with --pool.
---list-history / --clear-history manage that stored history.
-
-Press ESC at any time to abort.
-
-Run: .venv\\Scripts\\python.exe scripts\\calibrate.py
-"""
 from __future__ import annotations
 
 import argparse
@@ -125,105 +33,50 @@ from doomscroll.landmarks.mediapipe_backend import MediaPipeLandmarkBackend
 WINDOW_NAME = "doomscroll calibration"
 POINT_RADIUS = 18
 
-# Deliberately stricter than gaze_vector.DEFAULT_MIN_EYE_ASPECT_RATIO (which
-# live tracking uses by default). Live tracking needs recall -- rejecting a
-# genuine downward glance as a "blink" skips updating the gaze point for a
-# frame or two, so it's tuned loose by default. But calibration has the
-# opposite priority: precision. There's no cost to being picky here (both
-# protocols capture plenty of frames per point to choose from), and every
-# cost to not being: a frame where the eye is narrowed-but-not-closed still
-# measures a compressed iris offset (the eyelid is cropping how far the
-# iris visibly travels), which teaches the model "this small offset means a
-# target way down the screen" -- then that same small-offset reading
-# recurs for genuinely centered gaze live, and the model (especially the
-# local-correction stage, which is sensitive to a handful of mislabeled
-# neighbors) pulls it toward "down" too. The same narrowed-eye frames leak
-# into LIVE tracking too, just before/after a real blink's fully-closed
-# core -- visible as the live point dipping in a short curve right around
-# each blink rather than freezing cleanly -- see phase2_gaze_scroll.py's
-# --blink-min-ear flag to tighten the live threshold toward this one.
 CALIBRATION_MIN_EAR = 0.12
 
-# --- Dot-grid protocol mechanics -----------------------------------------
 
-STILL_INSTRUCTION = "keep your head still & facing forward -- move only your eyes to the dot"
+STILL_INSTRUCTION = "Keep your head COMPLETELY still -- follow the dot with your eyes only"
 
 SETTLE_S = 0.6
 CAPTURE_S = 1.4
 
-# 4x4 grid (16 points) for denser spatial coverage -- more independent
-# calibration events for RidgeCV's per-region regularization search to work
-# with, and better coverage near the edges where the dwell-based scroll
-# trigger actually needs to fire.
+# 4x4 grid of calibration dot positions (as screen fractions).
 _GRID_STEPS = [0.08, 0.36, 0.64, 0.92]
 TRAIN_GRID_FRACTIONS = [(fx, fy) for fy in _GRID_STEPS for fx in _GRID_STEPS]
 
-# Held out, deliberately off the training grid.
+# Held-out dot positions used to measure calibration accuracy.
 VALIDATION_FRACTIONS = [(0.22, 0.22), (0.78, 0.22), (0.5, 0.5), (0.22, 0.78), (0.78, 0.78)]
 
-# Reduced 5-point set (edge midpoints + center) repeated once per head-pose
-# variant below. Deliberately distinct from both TRAIN_GRID_FRACTIONS and
-# VALIDATION_FRACTIONS so this pass doesn't overlap either -- its purpose is
-# pose variation, not additional spatial coverage.
+# Dot positions used during each head-pose variant pass.
 POSE_VARIATION_FRACTIONS = [(0.08, 0.5), (0.92, 0.5), (0.5, 0.08), (0.5, 0.92), (0.5, 0.5)]
 
-# How far yaw/pitch may sit from dead-on-0 and still count as "straight" on
-# the pre-main-pass readiness screen (wait_for_front_ready()) -- purely
-# informational (like the pose-variant ranges, it's never enforced; SPACE
-# always proceeds), just loose enough that normal, comfortable sitting
-# posture reads as "straight" rather than nagging over a degree or two.
 FRONT_YAW_PITCH_TOLERANCE_DEG = 8.0
 FRONT_READY_INSTRUCTION = (
     "Sit facing forward, centered in frame, at whatever distance feels natural "
     "-- this is where the main pass will track your eyes from."
 )
 
-# "see that their head is in frame before starting" -- a generous padding
-# factor around the raw landmark bounding box, loose enough to still read
-# as "in frame" with some natural head motion.
 FACE_CROP_PAD_FRAC = 0.25
 
-# --- Continuous trajectory mechanics (--protocol trajectory) -------------
-#
-# See the module docstring for the design and the lag-correction rationale:
-# the frame captured at time t is labeled with where the programmed target
-# was at (t - TRAJECTORY_LAG_MS), not where it is now, to correct for
-# smooth-pursuit lag.
 
-TRAJECTORY_DURATION_S = 40.0  # main pass -- the whole anchor+raster path moves at one constant
-# speed derived from this duration (see gaze/trajectory.build_keyframes()), so a shorter value
-# here paces the WHOLE path faster, not just part of it.
-TRAJECTORY_POSE_VARIANT_DURATION_S = 15.0  # shorter run per head-pose variant (anchor-free path)
-TRAJECTORY_VALIDATION_DURATION_S = 18.0  # shorter run for the held-out validation pass (anchor-free path)
+TRAJECTORY_DURATION_S = 40.0
+TRAJECTORY_POSE_VARIANT_DURATION_S = 15.0
+TRAJECTORY_VALIDATION_DURATION_S = 18.0
 
-# Typical saccadic-latency ballpark: the eye reaches a moving target this
-# long after it moved, so the frame captured at time t is best labeled with
-# where the target was at (t - lag_ms), not where it is *now*.
 TRAJECTORY_LAG_MS = 220.0
 
-# How long the dot holds still at its starting position, after a pose-
-# ready/front-ready screen hands off to it, before it starts moving --
-# gives you a moment to actually find and settle on it (and gives the
-# camera a moment to drain any stale frames) rather than it being already
-# in motion the instant it appears.
 TRAJECTORY_SETTLE_S = 1.0
 
-# How long after a sharp raster direction change (a row reversal) to
-# discard frames, to skip the pursuit catch-up saccade rather than label it
-# as a (momentarily wrong) fixation. Anchor arrivals get their own, longer
-# settle window -- see gaze/trajectory.ANCHOR_SETTLE_MS (imported above).
 TRAJECTORY_TURN_DISCARD_MS = 250.0
 
-# Contiguous time window treated as one group for GazeCalibrator's
-# group-aware cross-validation (see calibration.py's GazeCalibrator
-# docstring for why group-aware CV matters at all) -- the trajectory
-# protocol's own analog of the dot-grid protocol's one-group-per-dot
-# grouping.
 TRAJECTORY_GROUP_WINDOW_MS = 1500.0
 
-_display_size: tuple[int, int] | None = None  # set once in main(), see _detect_display_size()
+# Actual fullscreen window size, detected once in main().
+_display_size: tuple[int, int] | None = None
 
 
+# One head-pose instruction plus the pose range considered "in range" for it.
 @dataclass
 class PoseVariant:
     label: str
@@ -233,71 +86,44 @@ class PoseVariant:
     z_delta_range: tuple[float, float] | None = None
 
 
-# Natural head-position variants: rotation (lean left/right turns the head
-# slightly) and translation (closer/back changes distance and, on most desk
-# setups, also height/angle a little) -- without this pass, the main dot-grid
-# pass alone gives the model close to zero variation in either. Kept to
-# "slight"/"natural" amounts deliberately: the point is to teach the model
-# to tolerate incidental real-world head motion, not to calibrate for
-# extreme poses it will rarely see in normal use. Together these six are what the project plan refers to
-# as left/right/up/down/forward/backward: lean LEFT/RIGHT = left/right,
-# tilt UP/DOWN = up/down, lean CLOSER/sit BACK = forward/backward.
-#
-# yaw_range/pitch_range/z_delta_range are shown live by wait_for_pose_ready()
-# as a rough visual guide only (green = "roughly there") -- not enforced;
-# SPACE always proceeds regardless of color, since a person's comfortable
-# "slight" lean varies and these are guides, not a pose to force exactly.
-# z_delta_range is relative to whatever camera distance you're at the
-# moment that variant's wait screen appears (there's no single fixed
-# "target distance" across different desks/chairs), negative = closer.
+# The six head-pose variants captured during training (left/right/closer/back/up/down).
 POSE_VARIANTS = [
     PoseVariant(
         "lean LEFT",
         "Lean your head slightly to the LEFT and hold that position -- keep tracking with your eyes only.",
-        yaw_range=(-30.0, -10.0),
+        yaw_range=(-30.0, -20.0),
     ),
     PoseVariant(
         "lean RIGHT",
         "Lean your head slightly to the RIGHT and hold that position -- keep tracking with your eyes only.",
-        yaw_range=(10.0, 30.0),
+        yaw_range=(20.0, 30.0),
     ),
     PoseVariant(
         "lean CLOSER",
         "Lean slightly CLOSER to the screen and hold that position -- keep tracking with your eyes only.",
-        z_delta_range=(-200.0, -80.0),
+        z_delta_range=(-200.0, -150.0),
     ),
     PoseVariant(
         "sit BACK",
         "Sit slightly further BACK from the screen and hold that position -- keep tracking with your eyes only.",
-        z_delta_range=(50.0, 130.0),
+        z_delta_range=(100.0, 130.0),
     ),
     PoseVariant(
         "tilt UP",
         "Tilt your head slightly UP and hold that position -- keep tracking with your eyes only, don't drop your eyes to compensate.",
-        pitch_range=(6.0, 20.0),
+        pitch_range=(15.0, 20.0),
     ),
     PoseVariant(
         "tilt DOWN",
         "Tilt your head slightly DOWN (not too far) and hold that position -- keep tracking with your eyes only, don't raise your eyes to compensate.",
-        pitch_range=(-20.0, -6.0),
+        pitch_range=(-15.0, -8.0),
     ),
 ]
 
 
+# Detects the fullscreen window's actual rendered pixel size.
 def _detect_display_size(screen_w: int, screen_h: int) -> tuple[int, int]:
-    """Ask OpenCV what pixel size it actually gave the fullscreen window,
-    instead of trusting our own screen-size query (get_screen_size()) to
-    exactly match it. Switching that query to Quartz (see dpi.py) was meant
-    to fix the grey strip left uncovered along one edge of the window, but a
-    gap was still observed afterwards -- so rather than keep guessing at the
-    exact cause (Retina backing-store scaling, multi-monitor placement, or
-    something else in how the Cocoa highgui backend sizes its content view),
-    ask OpenCV directly and scale every rendered frame to fill *that* size.
-    Falls back to (screen_w, screen_h) -- today's status quo -- if the query
-    isn't supported or the window hasn't settled yet."""
     blank = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-    # present twice: some backends only finish resizing the content view to
-    # the fullscreen frame after the window has already been shown once
     for _ in range(2):
         cv2.imshow(WINDOW_NAME, blank)
         cv2.waitKey(150)
@@ -310,16 +136,10 @@ def _detect_display_size(screen_w: int, screen_h: int) -> tuple[int, int]:
     return screen_w, screen_h
 
 
+# Scales a point from the window's rendered size to logical screen coordinates.
 def _map_real_to_logical(
     point: tuple[float, float], screen_w: int, screen_h: int, display_size: tuple[int, int] | None
 ) -> tuple[float, float]:
-    """Converts a point from the REAL on-screen pixel space the rendered
-    window actually occupies (display_size, as measured by
-    _detect_display_size()) into the LOGICAL screen_w x screen_h space
-    everything else in this file (patterns, drawn targets) is drawn and
-    reasoned about in. A no-op when the two spaces already match
-    (display_size is None, or equal to (screen_w, screen_h) -- the common
-    case on a non-scaled display)."""
     if display_size is None or display_size == (screen_w, screen_h):
         return point
     scale_x = screen_w / display_size[0]
@@ -327,46 +147,30 @@ def _map_real_to_logical(
     return (point[0] * scale_x, point[1] * scale_y)
 
 
+# Shows a frame in the calibration window, resizing it to the display size if needed.
 def _present(frame: np.ndarray) -> None:
-    """Shows `frame` (drawn in the logical, DPI-aware screen_w x screen_h
-    coordinate space that calibration math and the runtime gaze->scroll
-    mapping both rely on) scaled to fill the real detected window size, so
-    the two can differ without leaving any of the window uncovered."""
     if _display_size is not None and _display_size != (frame.shape[1], frame.shape[0]):
         frame = cv2.resize(frame, _display_size, interpolation=cv2.INTER_NEAREST)
     cv2.imshow(WINDOW_NAME, frame)
 
 
+# Resizes a webcam frame to screen size, or returns a black frame if none.
 def _camera_background(frame: np.ndarray | None, screen_w: int, screen_h: int) -> np.ndarray:
-    """Builds the live-preview background for a wait screen: the current
-    webcam frame stretched to fill the logical screen_w x screen_h canvas,
-    so a person getting into position can see whether their head is still
-    actually in frame -- rather than a plain black screen that gives no
-    feedback on framing at all. Falls back to black if no frame is
-    available yet (camera still warming up / a dropped read)."""
     if frame is None:
         return np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
     return cv2.resize(frame, (screen_w, screen_h))
 
 
+# Darkens a horizontal band of the canvas, used behind instruction text.
 def _darken_band(canvas: np.ndarray, y0: int, y1: int, alpha: float = 0.55) -> None:
-    """Dims a horizontal band of `canvas` in place, behind where overlay
-    text is about to be drawn. Needed once the background became a live
-    camera feed instead of solid black -- a bright/varied face/background
-    can otherwise wash out the instruction and readout text."""
     y0, y1 = max(0, y0), min(canvas.shape[0], y1)
     if y1 <= y0:
         return
     canvas[y0:y1] = (canvas[y0:y1].astype(np.float32) * (1 - alpha)).astype(np.uint8)
 
 
+# Wraps text into lines that fit within max_width.
 def _wrap_line(text: str, font: int, font_scale: float, thickness: int, max_width: int) -> list[str]:
-    """Greedily wraps `text` on spaces so every rendered line measures at
-    most max_width pixels (via cv2.getTextSize). Without this, a long
-    instruction string is drawn as a single line and silently runs off the
-    right edge of the screen instead of wrapping -- which is exactly what
-    happened with the longer pose-variant instructions (e.g. "tilt UP"/
-    "tilt DOWN")."""
     words = text.split(" ")
     lines: list[str] = []
     current = ""
@@ -383,17 +187,10 @@ def _wrap_line(text: str, font: int, font_scale: float, thickness: int, max_widt
     return lines
 
 
+# Returns whether a face is in frame and its padded bounding box.
 def _face_frame_status(
     points_px: np.ndarray | None, image_width: int, image_height: int
 ) -> tuple[str, bool, tuple[float, float, float, float] | None]:
-    """Pure logic behind the "is your head in frame" check shown on both
-    wait screens -- split out so it's unit-testable without a camera/GUI,
-    same as _pose_variant_readout()/_front_readout(). Returns (status text,
-    whether a face was detected at all, the (padded) face box in raw-frame
-    pixel coords or None. This used to also require that box to sit
-    comfortably inside the raw camera frame ("face is close to the edge
-    of frame -- center yourself"); that additional edge check has been
-    removed, so being off to one side no longer affects the status."""
     if points_px is None:
         return "no face detected -- move into the camera's view", False, None
 
@@ -405,12 +202,8 @@ def _face_frame_status(
     return "in frame", True, box
 
 
+# Returns a live readout of how close the current head pose is to the target variant.
 def _pose_variant_readout(head_pose: HeadPose | None, variant: PoseVariant, baseline_z: float | None) -> tuple[str, bool, float | None]:
-    """Returns (readout text, whether it looks roughly in range, updated
-    baseline_z). baseline_z is only set/used for z_delta_range variants --
-    it's captured from the first successful reading each time
-    wait_for_pose_ready() is called, since there's no fixed target distance
-    independent of the user's own desk setup."""
     if head_pose is None:
         return "face not detected", False, baseline_z
     if variant.yaw_range is not None:
@@ -432,6 +225,7 @@ def _pose_variant_readout(head_pose: HeadPose | None, variant: PoseVariant, base
     return "", True, baseline_z
 
 
+# Shows a head-pose instruction screen and waits for SPACE (or ESC to abort).
 def wait_for_pose_ready(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -440,12 +234,6 @@ def wait_for_pose_ready(
     screen_h: int,
     variant: PoseVariant,
 ) -> None:
-    """Self-paced replacement for a fixed-duration show_transition_message():
-    shows the instruction plus a live readout of whatever this variant's
-    pose actually depends on (yaw, pitch, or camera distance), plus a box
-    around your face so you can see you're still in frame while holding an
-    off-center pose, and waits for SPACE before capture starts. The
-    readout's color is feedback only, not a gate: SPACE always proceeds."""
     font, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 2, 60
     instruction_lines = _wrap_line(variant.instruction, font, 0.9, thickness, screen_w - 2 * margin)
     baseline_z: float | None = None
@@ -491,15 +279,12 @@ def wait_for_pose_ready(
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             raise KeyboardInterrupt
-        if key == 32:  # SPACE
+        if key == 32:
             return
 
 
+# Returns a live readout of whether the head is facing forward.
 def _front_readout(head_pose: HeadPose | None) -> tuple[str, bool]:
-    """Pure logic behind wait_for_front_ready()'s live readout -- split out
-    so it's unit-testable without a camera/GUI, same as
-    _pose_variant_readout(). Returns (readout text, whether yaw AND pitch
-    both look roughly straight)."""
     if head_pose is None:
         return "face not detected", False
     yaw_deg, pitch_deg = head_pose.yaw_deg, head_pose.pitch_deg
@@ -509,6 +294,7 @@ def _front_readout(head_pose: HeadPose | None) -> tuple[str, bool]:
     return f"yaw={yaw_deg:+.1f} deg  pitch={pitch_deg:+.1f} deg  distance={distance_mm:.0f}mm  ({status})", straight
 
 
+# Shows the "face forward" instruction screen and waits for SPACE (or ESC to abort).
 def wait_for_front_ready(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -517,9 +303,6 @@ def wait_for_front_ready(
     screen_h: int,
     instruction: str = FRONT_READY_INSTRUCTION,
 ) -> None:
-    """Live-camera readiness screen -- the same self-paced pattern as
-    wait_for_pose_ready(), but reporting "are you in frame at all" and
-    yaw/pitch/distance together."""
     font, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 2, 60
     instruction_lines = _wrap_line(instruction, font, 0.9, thickness, screen_w - 2 * margin)
 
@@ -562,31 +345,29 @@ def wait_for_front_ready(
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             raise KeyboardInterrupt
-        if key == 32:  # SPACE
+        if key == 32:
             return
 
 
-# --- Dot-grid pass ----------------------------------------------------
 
 
+# Draws one calibration dot with the still-head instruction below it.
 def draw_target(screen_w: int, screen_h: int, point_px: tuple[int, int], instruction: str = STILL_INSTRUCTION) -> np.ndarray:
     frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
     cv2.circle(frame, point_px, POINT_RADIUS, (0, 220, 255), -1)
     cv2.circle(frame, point_px, POINT_RADIUS, (255, 255, 255), 2)
 
-    # Wrap the bottom status text so long instructions (the pose-variant
-    # strings, in particular) stay on screen instead of running off the
-    # right edge -- see _wrap_line().
     font, font_scale, thickness, margin = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1, 20
     lines = _wrap_line(instruction, font, font_scale, thickness, screen_w - 2 * margin)
     line_height = 26
-    base_y = screen_h - 30  # baseline for the last line of wrapped text
+    base_y = screen_h - 30
     start_y = base_y - line_height * (len(lines) - 1)
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (margin, start_y + i * line_height), font, font_scale, (150, 150, 150), thickness)
     return frame
 
 
+# Captures gaze samples while the user holds still on one dot.
 def collect_samples_for_point(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -599,13 +380,6 @@ def collect_samples_for_point(
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     features: list[np.ndarray] = []
     targets: list[np.ndarray] = []
-    # Diagnostic counters -- when a point captures few/zero samples, these
-    # say *why* (no face in frame vs. blink-rejected vs. head-pose solve
-    # rejected) instead of leaving it a silent mystery. A run of "no_face"
-    # almost always means the pose asked for pushed the face out of the
-    # webcam's detection cone (e.g. laptop webcams already look down at you
-    # from above the screen, so tilting the chin down further is the
-    # direction most likely to do this).
     frames_seen = 0
     no_face = 0
     blink_rejected = 0
@@ -616,7 +390,7 @@ def collect_samples_for_point(
 
     settle_deadline = time.time() + SETTLE_S
     while time.time() < settle_deadline:
-        cam.read()  # drain frames so capture below starts fresh
+        cam.read()
         if cv2.waitKey(1) & 0xFF == 27:
             raise KeyboardInterrupt
 
@@ -634,8 +408,7 @@ def collect_samples_for_point(
         points_px = result.points_px()
         if not is_gaze_usable(points_px, min_ear=CALIBRATION_MIN_EAR):
             blink_rejected += 1
-            continue  # mid-blink (or too-narrowed-to-trust) frame -- skip it rather than risk a
-            # degraded iris reading becoming training data (see CALIBRATION_MIN_EAR above)
+            continue
         head_pose = pose_estimator.estimate(points_px, result.image_width, result.image_height)
         if head_pose is None:
             pose_rejected += 1
@@ -675,6 +448,7 @@ def collect_samples_for_point(
     return features, targets
 
 
+# Runs collect_samples_for_point() over a list of dot positions.
 def run_sequence(
     cam,
     backend,
@@ -698,42 +472,29 @@ def run_sequence(
         print(f"    captured {len(features)} samples")
         all_features.extend(features)
         all_targets.extend(targets)
-        all_groups.extend([group_offset + i] * len(features))  # tag every sample with which point it came from
+        all_groups.extend([group_offset + i] * len(features))
 
-    # np.array([]) on an empty list collapses to shape (0,) rather than
-    # (0, feature_dim)/(0, 2) -- harmless on its own, but np.concatenate()
-    # against the running (N, feature_dim) accumulator in main() then fails
-    # with a dimension mismatch. This happens for real whenever every single
-    # point in a sequence captures zero samples (e.g. a pose variant that
-    # loses face tracking throughout) -- not just a theoretical edge case.
-    # Force the correct 2D shape explicitly so an all-empty sequence is a
-    # harmless no-op contribution instead of a crash.
     if not all_features:
         return np.empty((0, FEATURE_DIM)), np.empty((0, 2)), np.empty((0,), dtype=int)
     return np.array(all_features), np.array(all_targets), np.array(all_groups)
 
 
+# Draws the moving dot for the trajectory protocol, with a progress readout.
 def _draw_trajectory_frame(
     screen_w: int, screen_h: int, point_px: tuple[int, int], progress: float
 ) -> np.ndarray:
-    """Just the moving dot plus a progress readout -- no preview of the
-    upcoming route."""
     frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
     cv2.circle(frame, point_px, POINT_RADIUS, (0, 220, 255), -1)
     cv2.circle(frame, point_px, POINT_RADIUS, (255, 255, 255), 2)
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(frame, f"{min(progress, 1.0) * 100:.0f}%", (20, 40), font, 0.7, (150, 150, 150), 2)
-    instr = "Keep your head COMPLETELY still -- follow the dot with your eyes only"
-    (iw, _), _ = cv2.getTextSize(instr, font, 0.6, 1)
-    cv2.putText(frame, instr, (screen_w // 2 - iw // 2, screen_h - 30), font, 0.6, (150, 150, 150), 1)
+    (iw, _), _ = cv2.getTextSize(STILL_INSTRUCTION, font, 0.6, 1)
+    cv2.putText(frame, STILL_INSTRUCTION, (screen_w // 2 - iw // 2, screen_h - 30), font, 0.6, (150, 150, 150), 1)
     return frame
 
 
+# Builds a shorter zig-zag path used for the pose-variant trajectory passes.
 def _short_trajectory_waypoints() -> list[tuple[float, float]]:
-    """A smaller boustrophedon raster, with no anchor-dwell points, for the
-    shorter pose-variant and validation trajectory passes -- see
-    run_trajectory_capture()'s full_path docstring for why the default
-    anchor+raster path doesn't fit a short duration."""
     rows = (0.2, 0.5, 0.8)
     cols = np.linspace(0.1, 0.9, 6)
     waypoints: list[tuple[float, float]] = []
@@ -743,6 +504,7 @@ def _short_trajectory_waypoints() -> list[tuple[float, float]]:
     return waypoints
 
 
+# Captures gaze samples continuously while a dot sweeps a path across the screen.
 def run_trajectory_capture(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -757,24 +519,6 @@ def run_trajectory_capture(
     group_offset: int = 0,
     full_path: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Continuously collects (gaze feature, target) samples while a single
-    dot sweeps the whole screen on its own programmed path (see
-    gaze/trajectory.py). Nothing here tracks your mouse; the target
-    position at any moment is just
-    keyframes.target_at(elapsed_ms), and every usable webcam frame along
-    the way is a candidate sample, labeled with the target's position
-    lag_ms earlier (see the module docstring's trajectory-protocol
-    section). Frames too close to a raster direction change or an anchor
-    arrival are discarded afterward (turn_discard_mask()) rather than kept
-    as a momentarily-wrong fixation label.
-
-    full_path=True (the default, used for the main pass) uses
-    gaze/trajectory.py's default 7-anchor+raster path; full_path=False
-    uses a smaller, anchor-free raster (_short_trajectory_waypoints()) for
-    the shorter pose-variant and validation passes. build_keyframes()
-    paces every segment of either path -- anchor transitions and raster
-    segments alike -- at the same constant angular velocity, derived
-    purely from the path's length and duration_s."""
     if full_path:
         path_fracs = build_waypoints()
         keyframes = build_keyframes(total_duration_ms=duration_s * 1000.0)
@@ -783,10 +527,6 @@ def run_trajectory_capture(
         keyframes = build_keyframes(total_duration_ms=duration_s * 1000.0, waypoints=path_fracs, n_anchors=0)
     path_px = [(fx * screen_w, fy * screen_h) for fx, fy in path_fracs]
 
-    # Trackability diagnostic, same as the design's own validation: how
-    # fast the dot itself moves, in degrees/sec of visual angle. A properly
-    # paced path should show this comfortably under the ~30 deg/s smooth-
-    # pursuit comfort ceiling almost everywhere.
     vel = measure_velocity(keyframes)
     over = vel.segments_over(30.0).sum()
     print(
@@ -794,16 +534,10 @@ def run_trajectory_capture(
         f"max={vel.max_deg_s:.1f} deg/s ({over} segment(s) over the ~30 deg/s comfort ceiling)"
     )
 
-    # Hold the dot still at its starting position for TRAJECTORY_SETTLE_S
-    # before it starts moving -- same purpose as the dot-grid protocol's
-    # own SETTLE_S: a moment to actually find/settle on it (and drain any
-    # stale camera frames) rather than it already being in motion the
-    # instant it appears. Not captured as training data, same as that
-    # other settle window.
     start_px = (int(path_px[0][0]), int(path_px[0][1]))
     settle_deadline = time.time() + TRAJECTORY_SETTLE_S
     while time.time() < settle_deadline:
-        cam.read()  # drain frames so capture below starts fresh
+        cam.read()
         _present(_draw_trajectory_frame(screen_w, screen_h, start_px, 0.0))
         if cv2.waitKey(1) & 0xFF == 27:
             raise KeyboardInterrupt
@@ -868,17 +602,10 @@ def run_trajectory_capture(
     capture_t_ms_arr = np.array(capture_t_ms, dtype=np.float64)
     features_arr = np.array(features)
 
-    # Label generation: the programmed target position at each frame's
-    # capture time, shifted back by the lag correction. Clipped to the
-    # path's own time range since a frame captured right at the very end
-    # can't be shifted past it.
     label_t_ms = np.clip(capture_t_ms_arr - lag_ms, 0.0, duration_ms)
     targets_frac = keyframes.target_at(label_t_ms)
     targets_px = targets_frac * np.array([screen_w, screen_h], dtype=np.float64)
 
-    # Direction-change / anchor-settle discard -- same two-window idea as
-    # the design this was ported from (a short window for raster reversals,
-    # a longer one for the bigger anchor-to-anchor jumps).
     turn_discard = turn_discard_mask(label_t_ms, keyframes.turn_t_ms, turn_discard_ms)
     settle_discard = turn_discard_mask(label_t_ms, keyframes.pause_arrival_t_ms, anchor_settle_ms)
     kept = ~(turn_discard | settle_discard)
@@ -895,28 +622,16 @@ def run_trajectory_capture(
     return features_arr, targets_px, groups
 
 
+# Returns the next unused group id, continuing after the given groups array.
 def _next_group_id(current: int, groups: np.ndarray) -> int:
-    """Picks up group numbering where the last pass left off -- same
-    "one past the max seen so far" idiom session_store.py's pool_sessions()
-    already uses to keep group ids globally unique."""
     if len(groups) == 0:
         return current
     return int(groups.max()) + 1
 
 
-# --- Protocol dispatch -------------------------------------------------
-#
-# Which of the two capture mechanics above actually runs is chosen in
-# main() by --protocol: (default) --protocol trajectory ->
-# _run_trajectory_training()/_run_trajectory_validation() (continuous
-# programmed dot path), else --protocol dots -> _run_grid_training()/
-# _run_grid_validation() (dot-by-dot, see module docstring). Split into training/validation
-# halves (rather than one do-everything function per protocol) so main()
-# can save_session() the training data to disk *before* the validation
-# pass runs -- so aborting (ESC) during validation doesn't lose a session
-# that was otherwise already safely captured.
 
 
+# Runs the dot-grid training pass: the main 4x4 grid, then each head-pose variant.
 def _run_grid_training(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -965,6 +680,7 @@ def _run_grid_training(
     return all_features, all_targets, all_groups
 
 
+# Runs the held-out dot-grid validation pass.
 def _run_grid_validation(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -974,10 +690,6 @@ def _run_grid_validation(
     gaze_extractor: GazeVectorExtractor,
 ) -> tuple[np.ndarray, np.ndarray]:
     print("Validation points:")
-    # Reuses wait_for_front_ready() (live camera + yaw/pitch/distance
-    # readout + SPACE to continue) rather than a blank fixed-duration
-    # message, so you can actually see you're back in frame and facing
-    # forward before validation starts capturing.
     wait_for_front_ready(
         cam,
         backend,
@@ -992,6 +704,7 @@ def _run_grid_validation(
     return val_features, val_targets
 
 
+# Runs the trajectory training pass: the main sweep, then each head-pose variant.
 def _run_trajectory_training(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -1035,6 +748,7 @@ def _run_trajectory_training(
     return all_features, all_targets, all_groups
 
 
+# Runs the held-out trajectory validation pass.
 def _run_trajectory_validation(
     cam: WebcamSource,
     backend: MediaPipeLandmarkBackend,
@@ -1061,6 +775,7 @@ def _run_trajectory_validation(
     return val_features, val_targets
 
 
+# Parses args, runs the chosen calibration protocol, fits and saves the best calibrator.
 def main() -> None:
     parser = argparse.ArgumentParser(description="doomscroll gaze calibration")
     parser.add_argument(
@@ -1160,12 +875,6 @@ def main() -> None:
         with WebcamSource(0) as cam:
             print("Calibration starting. ESC to abort.")
 
-            # Which capture mechanic actually runs depends on --protocol --
-            # see the module docstring and the "Protocol dispatch" section
-            # above. next_group_id is only meaningful for the trajectory
-            # protocol (so its validation pass's group ids don't collide
-            # with training's); the grid protocol's validation doesn't need
-            # it, matching how it always worked.
             if args.protocol == "trajectory":
                 all_features, all_targets, all_groups = _run_trajectory_training(
                     cam, backend, pose_estimator, screen_w, screen_h, gaze_extractor, lag_ms=args.lag_ms
@@ -1177,18 +886,13 @@ def main() -> None:
                 )
                 next_group_id = 0
 
-            # Always persist this session's raw samples, regardless of
-            # --pool: storing them costs little and makes pooling available
-            # on a later run, whereas discarding them now is irreversible.
-            # Deliberately BEFORE the validation pass below, so aborting
-            # (ESC) during validation doesn't lose training data that was
-            # otherwise already safely captured.
             save_session(
                 all_features, all_targets, all_groups, (screen_w, screen_h),
                 protocol=args.protocol,
             )
             print(f"\nSession saved ({len(all_features)} samples).")
 
+            # Fits a calibrator on the given data and prints its training/validation stats.
             def fit_and_report(features: np.ndarray, targets: np.ndarray, groups: np.ndarray, label: str) -> tuple[GazeCalibrator, float | None]:
                 calibrator = GazeCalibrator(poly_degree=args.poly_degree)
                 calibrator.fit(features, targets, groups=groups)
@@ -1196,10 +900,6 @@ def main() -> None:
                 print(f"\n[{label}] fitted on {len(features)} samples across {n_points} time-window groups.")
                 print(f"[{label}] RidgeCV selected alpha (x, y): {calibrator.selected_alpha}")
 
-                # Gain/compression check: a heavily-regularized fit can
-                # minimize validation error while still shrinking the
-                # model's dynamic range. Compare predicted spread to actual
-                # target spread directly, over the training data.
                 train_preds = np.array([calibrator.predict(f) for f in features])
                 target_range = targets.max(axis=0) - targets.min(axis=0)
                 pred_range = train_preds.max(axis=0) - train_preds.min(axis=0)
@@ -1215,14 +915,6 @@ def main() -> None:
                     )
                 return calibrator, err
 
-            # Without this, validation starts immediately after the last
-            # pose variant (tilt DOWN/the last grid point) with only the
-            # small grey status text changing -- easy to miss. Both
-            # protocols' validation helpers reuse wait_for_front_ready()
-            # (live camera + yaw/pitch/distance readout + SPACE to
-            # continue) rather than a blank message, so you can actually
-            # see you're back in frame and facing forward before
-            # validation starts.
             if args.protocol == "trajectory":
                 val_features, val_targets = _run_trajectory_validation(
                     cam, backend, pose_estimator, screen_w, screen_h, gaze_extractor, next_group_id, lag_ms=args.lag_ms
@@ -1251,14 +943,12 @@ def main() -> None:
                     pooled_calibrator, pooled_err = fit_and_report(
                         pooled_features, pooled_targets, pooled_groups, "pooled"
                     )
-                    # Keep whichever actually validates better -- pooling is
-                    # not assumed to help (see session_store.py docstring).
                     if pooled_err is not None and session_err is not None and pooled_err < session_err:
                         best_calibrator, best_err, best_label = pooled_calibrator, pooled_err, "pooled"
                     elif pooled_err is not None and session_err is not None:
                         print(f"\nPooled fit did not improve on this session alone -- keeping '{best_label}'.")
 
-            if best_err is not None and best_err / screen_diag > 0.08:
+            if best_err is not None and best_err / screen_diag > 0.10:
                 print("\nAccuracy looks poor -- consider recalibrating with better/more even lighting.")
 
             if len(val_features) == 0:
@@ -1266,8 +956,16 @@ def main() -> None:
 
             best_calibrator.save()
             print(f"Calibration profile saved to {DEFAULT_PROFILE_PATH} (using: {best_label}).")
+            if best_err is not None:
+                print(
+                    f"CALIBRATION_SUMMARY: err_px={best_err:.1f} "
+                    f"err_pct={100 * best_err / screen_diag:.1f} label={best_label}"
+                )
+            else:
+                print(f"CALIBRATION_SUMMARY: err_px=none err_pct=none label={best_label}")
     except KeyboardInterrupt:
         print("Calibration aborted.")
+        print("CALIBRATION_CANCELLED")
         sys.exit(1)
     finally:
         backend.close()

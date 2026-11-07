@@ -1,9 +1,5 @@
-"""Recorded session folder  ->  feature/label arrays (one .npz per session).
+# Builds and stores per-session feature datasets (math-model pipeline) from recordings.
 
-Slow step (runs MediaPipe over every frame), so it is separate from training:
-build once, then train/tune as often as you like. Re-run it only when the
-feature code or the label settings change.
-"""
 from __future__ import annotations
 
 import csv
@@ -19,46 +15,44 @@ from doomscroll.ml.features import FEATURE_NAMES
 from doomscroll.ml.labels import make_labels
 from doomscroll.recording.session import SessionPaths
 
-# frame -> (features or None, reason). Matches FrameFeaturizer.process, so
-# tests can pass a fake instead of running MediaPipe.
 FeaturizeFn = Callable[[np.ndarray, int], tuple[np.ndarray | None, str]]
 
 
+# One session's features filtered down to usable, labeled frames.
 @dataclass
 class LabeledFrames:
-    """Training-ready rows from one session (after lag + idle-cursor filtering)."""
 
     session_id: str
     screen_wh: tuple[int, int]
-    X: np.ndarray  # (N, FEATURE_DIM)
-    y_frac: np.ndarray  # (N, 2) cursor / screen size
-    t_ms: np.ndarray  # (N,)
-    participant: str = ""  # who was recorded; used for leave-person-out testing
+    X: np.ndarray
+    y_frac: np.ndarray
+    t_ms: np.ndarray
+    participant: str = ""
 
 
+# One session's raw extracted features, one row per recorded frame.
 @dataclass
 class SessionDataset:
-    """EVERY frame of a session: features (NaN row where the face/eyes were
-    unusable, with the reason), raw cursor, timestamps. Labels are NOT baked
-    in, so lag / idle-filter settings can be changed (and swept) at training
-    time without re-running the slow MediaPipe pass."""
 
     session_id: str
     participant: str
     screen_wh: tuple[int, int]
-    X: np.ndarray  # (N, FEATURE_DIM), NaN where invalid
-    reasons: np.ndarray  # (N,) "ok" | "no_face" | "no_pose" | "blink"
-    cursor_xy: np.ndarray  # (N, 2) px
-    t_ms: np.ndarray  # (N,)
+    X: np.ndarray
+    reasons: np.ndarray
+    cursor_xy: np.ndarray
+    t_ms: np.ndarray
 
+    # Labels frames with cursor position and filters to usable (on-screen, moving, feature-ok) ones.
     def labeled(self, lag_ms: float = 0.0, window_ms: float = 600.0, min_travel_px: float = 40.0) -> LabeledFrames:
         y_frac, label_ok = make_labels(self.t_ms, self.cursor_xy, self.screen_wh, lag_ms, window_ms, min_travel_px)
         keep = label_ok & (self.reasons == "ok")
         return LabeledFrames(self.session_id, self.screen_wh, self.X[keep], y_frac[keep], self.t_ms[keep], self.participant)
 
+    # Counts frames by extraction outcome (ok / no_face / blink / etc).
     def summary(self) -> dict:
         return {k: int(v) for k, v in zip(*np.unique(self.reasons, return_counts=True))}
 
+    # Saves this dataset to a compressed .npz file.
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -68,6 +62,7 @@ class SessionDataset:
                              "screen_wh": list(self.screen_wh)}),
         )
 
+    # Loads a dataset previously saved with save().
     @classmethod
     def load(cls, path: Path) -> "SessionDataset":
         d = np.load(path, allow_pickle=False)
@@ -78,8 +73,8 @@ class SessionDataset:
                    d["X"], d["reasons"], d["cursor_xy"], d["t_ms"])
 
 
+# Reads a recorded session's per-frame timestamp/cursor-position CSV log.
 def read_frame_log(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """-> (t_ms (N,), cursor_xy (N,2)); row i belongs to video frame i."""
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
     t = np.array([float(r["t_ms"]) for r in rows])
@@ -87,6 +82,7 @@ def read_frame_log(csv_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return t, xy
 
 
+# Runs featurize() over every frame of a recorded session's webcam video.
 def build_session_dataset(
     session_dir: Path | str,
     featurize: FeaturizeFn,
@@ -101,12 +97,12 @@ def build_session_dataset(
         raise RuntimeError(f"Cannot open {paths.webcam_video}")
     dim = len(FEATURE_NAMES)
     X = np.full((len(t_ms), dim), np.nan)
-    reasons = np.full(len(t_ms), "video_ended", dtype="<U12")  # overwritten for every decodable frame
+    reasons = np.full(len(t_ms), "video_ended", dtype="<U12")
     try:
         for i in range(len(t_ms)):
             ok, frame = cap.read()
             if not ok:
-                break  # video shorter than the log: remaining rows stay "video_ended"
+                break
             feats, reason = featurize(frame, int(t_ms[i]))
             reasons[i] = reason
             if feats is not None:
@@ -119,5 +115,6 @@ def build_session_dataset(
                           X, reasons, cursor_xy, t_ms)
 
 
+# Loads every session dataset (.npz) in a directory.
 def load_all(dataset_dir: Path | str) -> list[SessionDataset]:
     return [SessionDataset.load(p) for p in sorted(Path(dataset_dir).glob("*.npz"))]

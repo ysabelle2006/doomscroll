@@ -10,72 +10,135 @@ Requires Python 3.11 or 3.12 (`requires-python = ">=3.11,<3.13"` in `pyproject.t
 uv sync
 ```
 
-(or `pip install -e .` if you're not using `uv`). On Windows, also install the `windows` extra (`pywin32`). On macOS, the scroll/windowing backends and the Vision-based OCR content scanner need `pyobjc-framework-Quartz`, `pyobjc-framework-Cocoa`, and `pyobjc-framework-Vision` — these are plain `sys_platform == 'darwin'`-gated dependencies, so a plain `uv sync` / `pip install -e .` on macOS already includes them.
-
-The MediaPipe face landmark model is already checked into `models/face_landmarker.task` — no separate download needed.
-
-## Running it
-
-1. **`scripts/debug_view.py`** — Phase 1 sanity check: webcam capture + face-mesh landmarks + head pose, rendered live. Run this first to confirm your camera and landmark detection are working before anything else.
-2. **`scripts/calibrate.py`** — run this before the main app (see Calibration below).
-3. **`scripts/phase2_gaze_scroll.py`** — the end-to-end loop: calibrated gaze mapping + attention gate + a 3-tier content-aware scroll decision (see `src/doomscroll/fixation/scroll_trigger.py`). Press `q` to quit.
-
-**Live-tuning flags** (all optional; each has a default used when omitted):
-
-- `--smoothing-process-var` / `--smoothing-measurement-var` / `--smoothing-ema-alpha` — tune `GazePointSmoother`'s Kalman filter and extra EMA pass (defaults: `8.0` / `1.5` / `0.7`). Lower process-var / higher measurement-var / higher ema-alpha = smoother but more lag; the reverse = more responsive but more jittery.
-- `--blink-min-ear` — eye-aspect-ratio floor below which a frame is treated as a blink and skipped rather than fed to the smoother (default: `gaze_vector.DEFAULT_MIN_EYE_ASPECT_RATIO`, `0.08` — deliberately looser than calibration's own `0.12`, see `scripts/calibrate.py`'s `CALIBRATION_MIN_EAR` comment, so a genuine fast downward glance isn't mistaken for a blink). If the gaze point visibly dips and curves in a short semicircle/diagonal right around a real blink rather than freezing cleanly, that's a few narrowed-but-not-yet-closed frames leaking past this looser gate — try raising it toward `0.12`.
-
-## Calibration
+(or `pip install -e .` if you're not using `uv`). On Windows, also install the `windows` extra:
 
 ```
-python scripts/calibrate.py
+uv sync --extra windows   # installs pywin32
 ```
 
-The default protocol (`--protocol trajectory`) sweeps a single dot across the whole screen on its own in a programmed path (a handful of anchor points, then a full-screen raster sweep), for about 40 seconds. You just follow it with your eyes — nothing to click or trace yourself. Every usable webcam frame during the sweep becomes a training sample (not just one per dot), labeled with the dot's own position a fixed lag earlier (to correct for smooth-pursuit lag), with frames near a sharp turn or an anchor arrival discarded.
+On macOS, the scroll/windowing backends and the Vision-based OCR content scanner (`pyobjc-framework-Quartz`/`Cocoa`/`Vision`) are plain `sys_platform == 'darwin'`-gated dependencies, so a plain `uv sync` on macOS already includes them -- no separate extra needed.
 
-Immediately after, you'll be asked to hold a few different natural head positions (lean left/right, lean closer/sit back, tilt chin up/down) while repeating a short capture at each. This teaches the model to correct for incidental head movement instead of only ever having seen you sit still. Each pose shows a live readout and waits for you to press SPACE once you're actually holding the position (green = roughly there; it's a visual guide only — SPACE always advances regardless of color, since everyone's comfortable "slight lean" differs). Press ESC at any time to abort.
+The MediaPipe face landmark model is already checked into `models/face_landmarker.task` -- no separate download needed. A pretrained CNN gaze model (`models/gaze_cnn.pt`) and a baseline training dataset (`datasets/crops/`, `datasets/features/`) are checked in too, so the CNN path already works on a brand-new clone, before you've recorded anything yourself.
 
-A validation pass follows, reporting mean pixel error.
-
-**`--protocol dots`** — an alternative to the continuous sweep above: a 16-point on-screen grid instead of a single moving dot. Keep your head still and forward, track each dot with your eyes only, for a fixed capture window per point. It fits the exact same `GazeCalibrator` used by the default trajectory protocol — just from a handful of per-dot samples instead of continuously-collected ones — and saves to the same profile, so switching between `--protocol dots` and `--protocol trajectory` costs nothing but a recalibration:
+The CNN pipeline (used by "Create personal model" / "Quick personal calibration" below -- the math-model pipeline doesn't need it) additionally needs `torch`:
 
 ```
-python scripts/calibrate.py --protocol dots
+uv sync --extra cnn
 ```
 
-**Flags:**
-
-- `--pool` — also fits against this session pooled with your most recent stored sessions, and keeps whichever fit (session-only or pooled) actually validates better. Pooling is opt-in, not default, because your physical setup (seating, lighting, camera position) drifts between sittings, and pooling across a setup change can make the fit worse, not better — see `src/doomscroll/gaze/session_store.py`'s docstring for the full reasoning. `--pool` prints both validation numbers so you can judge empirically. Pooling only ever combines sessions that share screen size *and* capture protocol — a dot-grid session and a trajectory session are different enough distributions (static fixations vs. continuous lag-corrected pursuit) that mixing them risks silently training on nonsense.
-- `--protocol {dots,trajectory}` — capture mechanic (default: `trajectory`).
-- `--lag-ms` — `--protocol trajectory` only: how far back (ms) to shift each captured frame's target label to correct for smooth-pursuit lag (default: 220). If live predictions sit systematically off in one direction, try nudging this up or down (e.g. +-50ms) and recalibrating.
-- `--poly-degree` — degree of the polynomial feature expansion `GazeCalibrator` fits. Defaults to `2` (quadratic) for `--protocol trajectory` and `1` (linear) for `--protocol dots` — pass it explicitly to override either. `--protocol trajectory`'s continuous capture produces far more independent calibration groups than the dot-grid's ~16, which is specifically the condition under which a `2` (quadratic) fit stops extrapolating wildly and can instead correct real curvature in the eye-rotation-to-screen mapping; the dot-grid protocol stays at `1` since it doesn't have that many independent points. See `src/doomscroll/gaze/calibration.py`'s `GazeCalibrator` docstring for the full reasoning.
-- `--list-history` — list stored calibration sessions and exit.
-- `--clear-history` — delete all stored calibration sessions and exit. Do this after any real setup change (new desk, new lighting, different chair height).
-
-Every run is saved as its own timestamped session under your platform's app-data directory (`CALIBRATION_DIR/sessions/`, via `platformdirs`), independent of pooling.
-
-## Testing
+## Running the app
 
 ```
-pytest
+uv run app.py
 ```
 
-Runs the unit/synthetic test suite (`tests/`) — gaze vector math, head pose, smoothing, calibration fitting, session storage, and the pose-variant readout logic — all against synthetic, deterministic fixtures (no camera or MediaPipe model needed).
+(or `python app.py` with the venv active). This opens `app.py`'s Tk launcher -- the actual way to run doomscroll day to day. It's a thin GUI over the scripts in `scripts/`: it calls them as subprocesses with the right flags and in the right order, and surfaces their progress/output as popups and a log, rather than reimplementing anything itself. Those scripts can also be run by hand (see **Pipelines and system design** below) if you want more control.
 
-(pytest creates a `.pytest_cache/` directory to track state like last-failed tests between runs. It's local scratch state, not something to commit — pytest already drops its own `.gitignore` inside that directory, so it's self-ignoring regardless of this project's `.gitignore`.)
+The main page has two setup paths:
 
-## Project layout
+- **Standard Setup -- "Start eye tracking"**: runs `scripts/calibrate.py` (the math model -- no training step) with your choice of calibration type (Fast/trajectory or Precision/dots), optionally pooled with past sessions (`--pool`), then launches `scripts/phase2_gaze_scroll.py` to start scrolling. The quickest way to get the app running.
+- **Personalised Setup**:
+  - **"Create personal model"**: records a webcam session for however long you set (`scripts/record_session.py`), builds a crop dataset and a features dataset from it (`scripts/build_crops.py` / `build_dataset.py`), re-estimates the CNN's cursor lag (`scripts/train_model.py`), retrains the CNN on every session now in `datasets/crops/` (`scripts/train_cnn.py`), fits a quick per-user correction on top of it (`scripts/quick_calibrate.py`), then launches `phase2_gaze_scroll.py --model cnn`. Slowest path, but the most accurate, since it actually trains a model on your own eyes.
+  - **"Quick personal calibration"**: skips recording/training and only runs `quick_calibrate.py` then `phase2_gaze_scroll.py --model cnn` against whichever CNN is already saved at `models/gaze_cnn.pt`. Requires a CNN to already exist (either the checked-in one, or one "Create personal model" produced).
+
+Once scrolling is running, a "Stop Scrolling" button appears on the main page. (Running a script directly from a terminal instead of through the launcher: Ctrl+C stops it.)
+
+The **Settings** page has:
+
+- a live log of every subprocess the launcher runs, for debugging;
+- light/dark appearance, independent of the OS theme;
+- a **Developer view** toggle, which runs every step with `phase2_gaze_scroll.py --dev-view`, drawing the live OCR bounding-box overlay over whatever window you're reading, so you can see what the content scanner is doing;
+- **Clear all calibrations**, which deletes the saved math-model profile, the CNN's saved per-user correction, and every stored calibration session (the ones `--pool` pools against) -- both pipelines need a full recalibration afterward.
+
+## Running tests
 
 ```
-scripts/            Entry-point scripts (calibrate, debug view, main app)
-src/doomscroll/
-  capture/           Webcam input
-  landmarks/         Face landmark backends (MediaPipe)
-  gaze/              Gaze vector math, head pose, calibration model, session storage, smoothing
-  fixation/          Attention gate + window-relative mapping
-  scroll/            Platform scroll backends (macOS/Windows)
-  windowing/          Platform window-focus backends (macOS/Windows)
-  debug/             Debug overlay rendering
-tests/               Unit + synthetic integration tests
-models/              Checked-in MediaPipe face landmark model
+uv run pytest
 ```
+
+(or `pytest` with the venv active). Runs the suite under `tests/` -- gaze vector math, head pose estimation, pupil refinement, smoothing, calibration fitting (including synthetic end-to-end accuracy benchmarks), calibration session storage, the pose-variant/front-readout calibration UI logic, the attention gate, the content-aware scroll trigger, the macOS Vision bounding-box mapping, and the full recording -> dataset -> training -> model pipeline (the CNN tests need `torch`; they're skipped automatically via `pytest.importorskip` if it isn't installed). Everything runs against synthetic, deterministic fixtures -- no camera, MediaPipe model, or display needed.
+
+pytest creates a `.pytest_cache/` directory to track state like last-failed tests between runs -- it's local scratch state, not something to commit (pytest drops its own `.gitignore` inside it).
+
+## File structure
+
+```
+app.py                    Tk launcher -- the app's actual entry point (see "Running the app")
+
+scripts/                  Command-line entry points the launcher calls as subprocesses
+  debug_view.py              Phase-1 sanity check: webcam + landmarks + head pose, live
+  calibrate.py               Math-model calibration (dot-grid or continuous-trajectory protocol)
+  quick_calibrate.py         CNN per-user correction (quick 9-dot pass)
+  record_session.py          Records one webcam+cursor (+ optional screen) data-collection session
+  build_crops.py             Session(s) -> eye/face crop dataset (datasets/crops/), for the CNN
+  build_dataset.py           Session(s) -> handcrafted-feature dataset (datasets/features/), for the math model's lag estimate
+  train_model.py             Re-estimates the CNN's cursor-lag from datasets/features/
+  train_cnn.py               Trains the CNN on datasets/crops/, evaluated against ridge/hgb baselines
+  phase2_gaze_scroll.py      The live runtime: calibrated gaze + content-aware scroll loop
+
+src/doomscroll/           The installable package
+  capture/                   Webcam input (webcam.py)
+  landmarks/                 Face landmark backends (base.py, mediapipe_backend.py)
+  gaze/                      Gaze vector math, head pose, Kalman smoothing, the math calibration model, calibration session storage, trajectory-capture helpers
+  fixation/                  Window-relative gaze mapping, the attention gate, the scroll-trigger dwell logic
+  content/                   On-screen text block scanning (macOS Vision OCR) + gaze-vs-content dwell tracking
+  ml/                        Training/inference pipeline: features, labels, datasets (handcrafted + crop), ridge/hgb training, the CNN, and model load/save/correction
+  recording/                 Session recording (webcam+cursor+screen capture) and on-disk session layout
+  scroll/                    Platform scroll-injection backends (macOS/Windows)
+  windowing/                 Platform focused-window-bounds backends (macOS/Windows)
+  debug/                     Debug overlays (webcam HUD + the macOS on-screen content overlay)
+  dpi.py                     Windows DPI-awareness + cross-platform screen size
+
+tests/                     Unit + synthetic integration tests (see "Running tests")
+
+models/                    Checked-in: face_landmarker.task (MediaPipe), gaze_cnn.pt (CNN), gaze_model.joblib (CNN's lag estimate)
+datasets/                  Checked-in baseline training data (crops/, features/) -- see datasets/README.md
+lab1/ .. lab5/             SC2006 course lab deliverables (requirements, design docs, diagrams) -- unrelated to running the app
+INDEX.md                   Index of the lab1-lab5 deliverables
+```
+
+(`data/` -- raw per-session recordings from `record_session.py` -- is created at runtime and is git-ignored; "Create personal model" deletes a session's raw files from it automatically once they've been extracted into `datasets/`.)
+
+## Pipelines and system design
+
+doomscroll predicts where you're looking on screen and scrolls down automatically once it decides you've finished reading what's currently visible. There are two independent ways it turns a webcam frame into a screen point (the math model and the CNN), and one shared decision loop that turns that point into a scroll.
+
+### 1. Gaze estimation: two independent pipelines
+
+Both pipelines start from the same MediaPipe face landmarks (`landmarks/mediapipe_backend.py`) and head pose estimate (`gaze/head_pose.py`, solved with OpenCV's `solvePnP`), but diverge from there.
+
+**Math model** (`gaze/calibration.py`'s `GazeCalibrator`, used by `scripts/calibrate.py` / `phase2_gaze_scroll.py --model math`, the default):
+
+- Builds a 10-value feature vector per frame (`build_feature_vector`): the 4-value handcrafted gaze vector (mean + per-eye-difference iris offset, `gaze/gaze_vector.py`), plus head pose (yaw/pitch/roll) and head translation (x/y/z).
+- Fits a polynomial `RidgeCV` straight from that feature vector to a screen point, plus a local-correction term for nearby training samples -- entirely from the calibration session you just did. There's no separate pretrained math model to build on, which is why its calibration is the longer dot-grid or continuous-trajectory capture.
+- Calibration sessions are saved to disk (`gaze/session_store.py`) and can optionally be pooled with past sessions (`--pool`) that share the same screen size and capture protocol.
+
+**CNN model** (`ml/cnn.py`'s `GazeNet`, used by `scripts/train_cnn.py` / `phase2_gaze_scroll.py --model cnn`):
+
+- Looks at eye/face pixels directly instead of only handcrafted numbers: two eye crops through one shared-weight conv tower (`ml/eye_crops.py`, 36x60, roll-corrected, hist-equalized), plus a 64x64 face crop through its own tower, concatenated with the same 11-value landmark feature vector used by the ridge/hgb baselines (`ml/features.py`), through fully-connected layers to a screen fraction. Trained with a Huber-style (smooth L1) loss in pixel space.
+- Has to be trained offline first (`scripts/train_cnn.py`, on `datasets/crops/`), since it's a real neural net rather than a per-session fit. Because that's slow and data-hungry, the repo ships a pretrained `models/gaze_cnn.pt` plus the baseline dataset it was trained on, so the CNN path works on a fresh clone.
+- Calibrating it per-user only needs a tiny affine (scale+shift) correction on top (`scripts/quick_calibrate.py`'s 9-dot pass, `ml/model.py`'s `AffineCorrection`) -- hence "quick" calibration.
+
+### 2. Training data pipeline (feeds the CNN, and the CNN's lag estimate)
+
+```
+record_session.py  -->  build_crops.py    --MediaPipe-->  datasets/crops/*.npz    --> train_cnn.py   --> models/gaze_cnn.pt
+(one session,       \-> build_dataset.py --MediaPipe-->  datasets/features/*.npz --> train_model.py --> lag_ms (read by train_cnn.py)
+ one shared clock)
+```
+
+- `record_session.py` runs one process, one loop, one clock: every frame gets a timestamp and the cursor position at that instant, written to `webcam.mp4` + `frames.csv` (frame *i* of the video is row *i* of the CSV -- nothing to align afterward). The cursor position IS the training label, under the assumption the person was looking at it.
+- `build_crops.py` / `build_dataset.py` each run MediaPipe once per session (slow) to turn raw video into crops/features -- this only has to happen once per session, not once per training run.
+- Labels (which frame's cursor position to use, and a lag correction for the delay between the eye arriving and the hand following) are applied at *training* time (`ml/labels.py`), not at build time, so lag and filtering can be swept without re-running MediaPipe. `train_model.py` sweeps a handful of lag candidates (scored with ridge, as a cheap proxy) and saves the best as `lag_ms`; `train_cnn.py` reads that automatically on its next retrain.
+- `train_cnn.py` holds out whole sessions (or whole people, with `--cv person`) for an honest test, with ridge and gradient-boosting baselines re-run on the exact same frames and folds so the comparison is fair, then trains the final model on everything.
+- `datasets/` (crops + features) is a separate, permanent, anonymized archive from `data/` (raw per-session staging, never committed) -- see `datasets/README.md` for the naming/anonymization scheme. The math model never touches any of this; it only ever uses whichever session you just calibrated with.
+
+### 3. The live runtime (`phase2_gaze_scroll.py`)
+
+Per frame: webcam -> MediaPipe landmarks -> head pose -> (math feature vector + `GazeCalibrator`) or (crops + `CnnGazeModel`) -> a predicted screen point -> `gaze/smoothing.py`'s Kalman filter + EMA pass to de-jitter it. Three mostly-independent systems then act on that point:
+
+- **Attention gate** (`fixation/attention_gate.py`): pauses scrolling automatically if your head pose says you've looked away for longer than a grace period, and resumes automatically once you look back -- no shortcut key, no manual pause.
+- **Content-aware scroll trigger** (`fixation/scroll_trigger.py` + `content/gaze_content.py`): a 3-tier dwell-based decision -- (1) gaze near the bottom 15% of the window, (2) gaze has dwelled on and passed the lowest visible line of text, (3) every text block between the last scroll position and the current gaze has already been dwelled on long enough to count as read. Tiers 2-3 need on-screen text blocks from `content/macos_backend.py`'s Vision OCR scan, so they're macOS-only -- Windows always runs tier-1-only (bottom-of-window).
+- **Scroll injection** (`scroll/`) and **focused-window bounds** (`windowing/`): platform backends (macOS via Quartz, Windows via win32) that actually send the scroll and tell the content scanner which window to OCR.
+
+`debug/` draws optional visual aids: a webcam HUD (iris points, a gaze minimap) and, on macOS, a transparent on-screen overlay outlining the content blocks the scanner found and whether each counts as read yet (`--dev-view`).

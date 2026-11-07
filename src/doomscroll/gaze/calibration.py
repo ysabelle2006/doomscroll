@@ -1,19 +1,6 @@
-"""Screen-space gaze mapping: Ridge regression from
-[eye-in-head vector (4), head rotation (3), head translation (3)] ->
-(screen_x, screen_y).
+# Fits a per-user gaze-point predictor: polynomial RidgeCV plus a local
+# nearest-neighbor residual correction, saved/loaded from disk.
 
-Including head pose -- both rotation (yaw/pitch/roll) and translation
-(the solvePnP position vector, i.e. where the head sits relative to the
-camera) -- as regressor inputs, rather than geometrically subtracting them
-out, is what lets the model absorb natural head-pose variation captured
-during calibration, so small incidental head motion at runtime doesn't
-require recalibration -- see the project plan's calibration design
-rationale. Translation matters here as much as rotation: the eye-in-head
-offset for a fixed gaze target changes as the head moves nearer/farther or
-side-to-side relative to the screen. See calibrate.py's head-pose
-variation pass for how meaningful variation in both is captured during
-calibration rather than left at near-zero.
-"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -29,31 +16,19 @@ from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 CALIBRATION_DIR = Path(user_data_dir("gazescroll")) / "calibration"
 DEFAULT_PROFILE_PATH = CALIBRATION_DIR / "default.joblib"
 
-FEATURE_DIM = 10  # 4 (eye-in-head) + 3 (yaw, pitch, roll) + 3 (head translation x,y,z mm)
+FEATURE_DIM = 10
 
 MIN_CALIBRATION_SAMPLES = 30
-MAX_LEAVE_ONE_GROUP_OUT_GROUPS = 20  # switch to GroupKFold beyond this many points
+MAX_LEAVE_ONE_GROUP_OUT_GROUPS = 20
 
-# Log-spaced search range handed to RidgeCV. Sized for the default linear
-# model (11 params incl. bias): heavy regularization shrinks the fitted
-# mapping's slope/gain, which technically minimizes validation MSE on
-# noisy calibration data but compresses the model's dynamic range in
-# practice -- the mapped point would need to look far past the real
-# screen edge (e.g. down at the trackpad) before reaching the actual edge.
-# A lower ceiling keeps RidgeCV from reaching for regularization that
-# strong on a model this small.
 DEFAULT_ALPHAS = tuple(np.logspace(-3, 2, 12))
 
-# Local-correction stage settings (see GazeCalibrator docstring). Bandwidth
-# is in the *scaled+poly feature space* (post-StandardScaler units), so
-# "1.5" roughly means "within about 1.5 standard deviations of feature
-# distance" gets meaningful weight, not 1.5 raw units of any particular
-# feature.
 LOCAL_CORRECTION_K = 8
 LOCAL_CORRECTION_BANDWIDTH = 1.5
-LOCAL_CORRECTION_MAX_WEIGHT = 0.5  # cap on how much of the local residual to trust, even at zero distance
+LOCAL_CORRECTION_MAX_WEIGHT = 0.5
 
 
+# Concatenates gaze, head-pose, and head-translation features into one vector.
 def build_feature_vector(
     gaze_vector: np.ndarray,
     head_pose_deg: tuple[float, float, float],
@@ -68,64 +43,8 @@ def build_feature_vector(
     )
 
 
+# Predicts a screen point from a gaze feature vector: global Ridge fit + local correction.
 class GazeCalibrator:
-    """Degree-1 (linear) by default: a higher-degree polynomial expansion
-    fit on only ~16 independent calibration points is prone to
-    extrapolating wildly for any live input that isn't close to one of
-    those clusters, regardless of regularization strategy (RidgeCV,
-    group-aware CV). A bounded, somewhat less accurate linear fit is the
-    safer choice for this small-sample-per-session regime. Revisit
-    degree=2 if calibration ever collects substantially more independent
-    points, or move to an appearance-based model instead of chasing more
-    polynomial capacity here. scripts/calibrate.py's --protocol trajectory
-    (continuous capture, dozens of independent time-window groups rather
-    than ~16 dot-grid points) is exactly that "substantially more
-    independent points" case -- its --poly-degree flag defaults to 2
-    there specifically (still 1 for --protocol dots), overridable either
-    way.
-
-    StandardScaler runs first: the raw feature vector mixes a unitless
-    gaze-offset signal (~+-0.1 range) with head-rotation degrees (~+-30-50
-    range) and head-translation millimeters (~hundreds), and Ridge's L2
-    penalty treats coefficient magnitude uniformly -- without scaling, the
-    small-scale (but most informative) gaze signal needs large coefficients
-    and gets disproportionately penalized relative to head pose, which is
-    backwards from what the model should learn.
-
-    Regularization strength is chosen by cross-validation over DEFAULT_ALPHAS
-    rather than a hand-picked fixed alpha -- but critically, that CV must be
-    *group-aware* (fit() takes a `groups` array, one id per calibration
-    point). Plain per-sample leave-one-out is invalid here: the ~15-20 frames
-    captured per calibration point are highly correlated near-duplicates, so
-    ordinary LOO leaves near-identical frames from the same point in the
-    training fold, making an overfit model look like it generalizes
-    perfectly. That systematically selects too little regularization, and
-    the resulting degree-2 polynomial model then extrapolates wildly (huge
-    x/y values, clamped to a screen corner after fraction-clipping) for any
-    live input that isn't essentially an exact calibration point. Leaving out
-    one whole calibration point per fold forces the model to generalize to
-    a genuinely new head/eye position, matching how it's actually used.
-
-    x and y are fit as two independent RidgeCV models sharing one
-    preprocessing pipeline (rather than one multi-output RidgeCV with
-    alpha_per_target) because sklearn's alpha_per_target optimization only
-    applies to the default fast leave-one-out path, not to an explicit
-    custom `cv` -- and a custom group-aware cv is exactly the point here.
-
-    Local residual correction on top: after fitting the global linear
-    model, this stores each training sample's residual (true target minus
-    the global model's prediction for it) alongside its transformed feature
-    vector. At prediction time, it finds the K nearest calibration samples
-    (in transformed feature space) to the live input and blends a
-    distance-weighted average of *their* residuals into the global
-    prediction -- weighted down to near-zero for a live input that's far
-    from any calibration sample, so it can only ever nudge the global
-    model's prediction, never override it far from real training data.
-    This is deliberately NOT a global nonlinear model: it can only
-    correct in neighborhoods where enough real calibration data actually
-    exists, which is exactly where nonlinear correction is trustworthy
-    and where a global polynomial's extrapolation risk doesn't apply.
-    """
 
     def __init__(
         self,
@@ -149,28 +68,23 @@ class GazeCalibrator:
         self._local_k = local_correction_k
         self._local_bandwidth = local_correction_bandwidth
         self._local_max_weight = local_correction_max_weight
-        self._train_X: np.ndarray | None = None  # transformed training features, for neighbor search
-        self._train_residuals: np.ndarray | None = None  # (N, 2), true - global_pred on training data
+        self._train_X: np.ndarray | None = None
+        self._train_residuals: np.ndarray | None = None
 
+    # True once fit() or load() has set up the model.
     @property
     def is_fitted(self) -> bool:
         return self._fitted
 
+    # The RidgeCV-selected regularization strength for x and y.
     @property
     def selected_alpha(self) -> tuple[float, float]:
-        """The alpha RidgeCV chose via cross-validation, per output axis
-        (x, y) -- useful to sanity-check calibration quality. A value at or
-        near the top of DEFAULT_ALPHAS' range is a sign the fit is still
-        struggling to generalize even with heavy regularization."""
         if not self._fitted:
             raise RuntimeError("GazeCalibrator.selected_alpha accessed before fit()/load()")
         return (float(self._ridge_x.alpha_), float(self._ridge_y.alpha_))
 
+    # Fits the polynomial Ridge regressors and records training residuals for local correction.
     def fit(self, features: np.ndarray, targets: np.ndarray, groups: np.ndarray | None = None) -> None:
-        """features: (N, FEATURE_DIM), targets: (N, 2) screen (x, y) px.
-        groups: (N,) calibration-point id per sample -- strongly recommended
-        (see class docstring); without it, falls back to RidgeCV's default
-        per-sample LOO, which is known to under-regularize on this data."""
         if features.shape[0] < MIN_CALIBRATION_SAMPLES:
             raise ValueError(
                 f"Need at least {MIN_CALIBRATION_SAMPLES} samples for a stable polynomial "
@@ -199,10 +113,8 @@ class GazeCalibrator:
         self._train_X = X
         self._train_residuals = targets - global_preds
 
+    # Returns a small correction based on the nearest training points' residuals.
     def _local_correction(self, X_query: np.ndarray) -> np.ndarray:
-        """X_query: (1, D) transformed feature vector. Returns a (2,)
-        correction to add to the global prediction -- zero if there's no
-        training data or the query is far from all of it."""
         if self._train_X is None or len(self._train_X) < self._local_k:
             return np.zeros(2)
 
@@ -213,15 +125,13 @@ class GazeCalibrator:
         weights = np.exp(-(nearest_dists**2) / (2 * self._local_bandwidth**2))
         weight_sum = float(weights.sum())
         if weight_sum < 1e-8:
-            return np.zeros(2)  # too far from any calibration sample -- don't extrapolate locally
+            return np.zeros(2)
 
         weighted_residual = (weights[:, None] * self._train_residuals[nearest_idx]).sum(axis=0) / weight_sum
-        # Confidence shrinks toward 0 as the closest neighbor gets farther
-        # away, capped at local_max_weight even at zero distance -- the
-        # global model always keeps at least half the say.
         confidence = float(np.clip(weights.max(), 0.0, 1.0)) * self._local_max_weight
         return confidence * weighted_residual
 
+    # Predicts a screen point for one feature vector.
     def predict(self, feature: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("GazeCalibrator.predict() called before fit()/load()")
@@ -229,12 +139,13 @@ class GazeCalibrator:
         global_pred = np.array([self._ridge_x.predict(X)[0], self._ridge_y.predict(X)[0]])
         return global_pred + self._local_correction(X)
 
+    # Returns the mean pixel error of predictions against held-out targets.
     def validate(self, features: np.ndarray, targets: np.ndarray) -> float:
-        """Mean Euclidean pixel error on held-out (features, targets)."""
         predictions = np.array([self.predict(f) for f in features])
         errors = np.linalg.norm(predictions - targets, axis=1)
         return float(np.mean(errors))
 
+    # Saves the fitted model to disk.
     def save(self, path: Path | str = DEFAULT_PROFILE_PATH) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +163,7 @@ class GazeCalibrator:
             path,
         )
 
+    # Loads a previously saved model from disk.
     @classmethod
     def load(cls, path: Path | str = DEFAULT_PROFILE_PATH) -> "GazeCalibrator":
         path = Path(path)

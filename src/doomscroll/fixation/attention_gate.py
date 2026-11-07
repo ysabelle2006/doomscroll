@@ -1,12 +1,4 @@
-"""Off-screen / turned-away pause gate.
-
-Deliberately a coarse, high head-pose-angle threshold (not a measure of
-gaze-position jitter, which gaze/smoothing.py's Kalman filter already
-handles separately), so ordinary reading head movement never approaches
-it while an actual "user got up / turned away" event reliably does. A
-short grace period avoids pausing on a single missed-detection frame or a
-quick glance aside.
-"""
+# Pauses scrolling when the user's head pose shows they've looked away.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,6 +6,7 @@ from dataclasses import dataclass
 from doomscroll.gaze.head_pose import HeadPose
 
 
+# Thresholds for what counts as looking away, and how long before pausing.
 @dataclass
 class AttentionGateConfig:
     max_yaw_deg: float = 35.0
@@ -21,14 +14,16 @@ class AttentionGateConfig:
     pause_grace_ms: int = 500
 
 
+# Tracks head pose over time to decide whether scrolling should be paused.
 class AttentionGate:
+    # Stores the gate config and resets look-away tracking state.
     def __init__(self, config: AttentionGateConfig | None = None):
         self.config = config or AttentionGateConfig()
         self._look_away_since_ms: int | None = None
         self._paused = False
 
+    # Updates look-away tracking from the latest head pose; returns whether paused.
     def update(self, head_pose: HeadPose | None, timestamp_ms: int) -> bool:
-        """Returns True if the system should PAUSE (no scrolling) this tick."""
         looking_away = (
             head_pose is None
             or abs(head_pose.yaw_deg) > self.config.max_yaw_deg

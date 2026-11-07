@@ -1,20 +1,6 @@
-"""~15-second per-user calibration for the CNN gaze model, fitted ON TOP
-of the pretrained CNN (scripts/train_cnn.py trains that offline from
-data_raw -- never here).
+# Quick 9-dot calibration pass for the CNN gaze model -- fits a small
+# per-user correction on top of an existing trained model.
 
-The CNN already knows the general eye+head -> screen mapping from many
-recorded frames. This only shows 9 dots to measure how THIS
-person/camera/seat differs, and fits a tiny scale+shift correction (see
-ml/model.py: AffineCorrection). Compare with scripts/calibrate.py, the
-math model's own calibration, which has to learn the entire mapping from
-scratch via a much longer capture (see its own docstring) -- the two
-models are calibrated independently and never share a capture mechanic.
-
-Unlike scripts/calibrate.py you may move your head naturally -- the CNN
-handles it.
-
-Run: python scripts/quick_calibrate.py        (ESC aborts)
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,28 +18,33 @@ from doomscroll.dpi import ensure_dpi_aware, get_screen_size
 from doomscroll.ml.features import FrameFeaturizer
 from doomscroll.ml.model import correction_path_for, fit_user_correction, load_gaze_model
 
-# Defined locally (not imported from doomscroll.ml.cnn) so importing this
-# module doesn't force torch to load before argparse has even run.
 DEFAULT_CNN_PATH = Path(__file__).resolve().parents[1] / "models" / "gaze_cnn.pt"
 
+# Dot grid positions (as screen fractions) and timing for the 9-dot pass.
 WINDOW_NAME = "doomscroll quick calibration"
 STEPS = (0.1, 0.5, 0.9)
-POINTS = [(fx, fy) for fy in STEPS for fx in STEPS]  # 3x3 grid, fractions of the screen
-SETTLE_S = 0.7  # let the eyes arrive
+POINTS = [(fx, fy) for fy in STEPS for fx in STEPS]
+SETTLE_S = 0.7
 CAPTURE_S = 0.8
 MIN_FRAMES_PER_POINT = 5
 RADIUS = 18
 
+STILL_INSTRUCTION = "Keep your head COMPLETELY still -- follow the dot with your eyes only"
 
+
+# Draws one calibration dot; returns True if ESC was pressed.
 def show_dot(w: int, h: int, px: tuple[int, int]) -> bool:
-    """Draw one dot; returns True if ESC was pressed."""
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
     cv2.circle(canvas, px, RADIUS, (0, 220, 255), -1)
     cv2.circle(canvas, px, RADIUS, (255, 255, 255), 2)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (iw, _), _ = cv2.getTextSize(STILL_INSTRUCTION, font, 0.6, 1)
+    cv2.putText(canvas, STILL_INSTRUCTION, (w // 2 - iw // 2, h - 30), font, 0.6, (150, 150, 150), 1)
     cv2.imshow(WINDOW_NAME, canvas)
     return (cv2.waitKey(1) & 0xFF) == 27
 
 
+# Runs the 9-dot pass, fits a correction from predicted-vs-true gaze, and saves it.
 def main() -> None:
     ap = argparse.ArgumentParser(description="doomscroll CNN quick calibration")
     ap.add_argument(
@@ -64,13 +55,13 @@ def main() -> None:
 
     ensure_dpi_aware()
     w, h = get_screen_size()
-    model = load_gaze_model(args.model, with_correction=False)  # deliberately WITHOUT any old correction
+    model = load_gaze_model(args.model, with_correction=False)
     correction_path = correction_path_for(args.model)
     featurizer = FrameFeaturizer()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    cv2.moveWindow(WINDOW_NAME, 0, 0)  # same macOS fullscreen workaround as calibrate.py
+    cv2.moveWindow(WINDOW_NAME, 0, 0)
     cv2.resizeWindow(WINDOW_NAME, w, h)
     for _ in range(5):
         cv2.imshow(WINDOW_NAME, np.zeros((h, w, 3), dtype=np.uint8))
@@ -86,6 +77,7 @@ def main() -> None:
                 while time.monotonic() - start < SETTLE_S + CAPTURE_S:
                     if show_dot(w, h, px):
                         print("Aborted; nothing saved.")
+                        print("CALIBRATION_CANCELLED")
                         sys.exit(1)
                     ok, frame = cam.read()
                     if not ok or time.monotonic() - start < SETTLE_S:
@@ -94,7 +86,7 @@ def main() -> None:
                     if r.features is not None:
                         fracs.append(model.predict_frac_frame(r.points_px, r.pose, r.gray))
                 if len(fracs) >= MIN_FRAMES_PER_POINT:
-                    predicted.append(np.median(fracs, axis=0))  # median: robust to a stray frame
+                    predicted.append(np.median(fracs, axis=0))
                     truth.append([fx, fy])
                 else:
                     print(f"  no usable frames for dot at ({fx}, {fy}); skipped")
@@ -109,8 +101,13 @@ def main() -> None:
     if after < before:
         correction.save(correction_path)
         print(f"Saved -> {correction_path}")
+        used_err, used_label = after, "with correction"
     else:
         print("Correction doesn't help for you; not saving (the base model is used as-is).")
+        used_err, used_label = before, "without correction (base model)"
+
+    screen_diag = (w**2 + h**2) ** 0.5
+    print(f"CALIBRATION_SUMMARY: err_px={used_err:.1f} err_pct={100 * used_err / screen_diag:.1f} label={used_label}")
 
 
 if __name__ == "__main__":

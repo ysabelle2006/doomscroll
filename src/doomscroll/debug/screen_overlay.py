@@ -1,35 +1,4 @@
-"""A live, click-through, transparent screen overlay (macOS-only) that
-draws the OCR boxes + current gaze dot directly on top of the real
-content you're reading, updating every tick.
-
-Deliberately excluded from feeding back into the pipeline it's debugging,
-two different ways:
-
-  - setSharingType_(NSWindowSharingNone) tells the window server to leave
-    this window out of any screen capture it composites for other
-    callers -- including the mss-based screenshot content/macos_backend.py
-    takes for OCR. Without this, the overlay's own boxes would show up in
-    the next OCR scan, which would then try to recognize text inside
-    them, feeding the debug view back into the thing it's supposed to be
-    observing.
-  - It's click-through (setIgnoresMouseEvents_(True)) and never becomes
-    the key/main window or activates its own app, so it can never cause
-    this process to become the "frontmost application" -- which is
-    exactly what windowing/macos_backend.py's get_focused_window_bounds()
-    keys off of (frontmost app -> that app's on-screen windows). So it
-    can never get mistaken for the window you're actually looking at,
-    the way a clickable debug window could.
-
-Not exercised on the Linux dev machine -- same
-caveat as this project's other macOS-only backends (content/macos_backend.py,
-windowing/macos_backend.py): the AppKit API surface here (NSWindow/NSView
-construction by hand, window levels, the sharing-type exclusion, the
-Quartz<->AppKit coordinate flip) is unverified until it actually runs on
-macOS. Every call into this from phase2_gaze_scroll.py is wrapped in a
-try/except there, so if something about the window itself misbehaves
-(doesn't appear, doesn't move/update, throws), that's isolated to this
-module and degrades to "no overlay" rather than taking down gaze tracking.
-"""
+# Transparent click-through macOS overlay window drawing content blocks and gaze dot.
 from __future__ import annotations
 
 from doomscroll.content.base import ContentBlock
@@ -45,32 +14,26 @@ try:
         NSScreen,
         NSView,
         NSWindow,
-        NSWindowSharingNone,
     )
 
     _OVERLAY_AVAILABLE = True
 except ImportError:
     _OVERLAY_AVAILABLE = False
 
-# NSBackingStoreBuffered's documented value -- hardcoded rather than
-# imported. These old AppKit integer constants are stable, unchanged-for-
-# decades API, but whether a given pyobjc version happens to bind the
-# *name* at the top level of AppKit has been inconsistent across versions
-# in the wild; the raw value isn't.
+# AppKit window-level/collection-behavior/backing-store constants for the overlay.
 _NS_BACKING_STORE_BUFFERED = 2
-# NSScreenSaverWindowLevel's documented value -- high enough to float
-# above ordinary application windows. Same hardcoding rationale as above.
 _NS_SCREEN_SAVER_WINDOW_LEVEL = 1000
+_NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES = 1 << 0
+_NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY = 1 << 8
+_NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE = 1 << 6
 
 
 if _OVERLAY_AVAILABLE:
 
+    # NSView that draws content block outlines, the end-of-content line, and gaze dot.
     class _OverlayView(NSView):
-        """Owns the actual drawing. State is pushed in from outside via
-        plain attribute assignment (see ScreenOverlay.update) rather than
-        through drawRect_'s own arguments, which only ever gets the dirty
-        rect, not application state."""
 
+        # Initializes overlay drawing state (blocks, gaze point, seen ids, origin).
         def initWithFrame_(self, frame):
             self = objc.super(_OverlayView, self).initWithFrame_(frame)
             if self is None:
@@ -79,23 +42,18 @@ if _OVERLAY_AVAILABLE:
             self.ov_gaze_xy: tuple[float, float] | None = None
             self.ov_seen_ids: frozenset[str] = frozenset()
             self.ov_end_margin_px: float = 20.0
-            # This window's own top-left corner, in the same absolute
-            # screen-pixel space `ov_blocks`/`ov_gaze_xy` are given in --
-            # every draw call below subtracts this back out to get
-            # view-local coordinates.
             self.ov_origin_xy: tuple[int, int] = (0, 0)
             return self
 
+        # Flips coordinate system so y increases downward.
         def isFlipped(self) -> bool:
-            # Top-left origin, y increasing downward -- matches this
-            # project's screen-pixel convention everywhere else
-            # (WindowBounds, ContentBlock, gaze points), so none of the
-            # drawing below needs its own flip math.
             return True
 
+        # Overlay is transparent, not opaque.
         def isOpaque(self) -> bool:
             return False
 
+        # Draws block outlines (color by seen/lowest status), the end line, and the gaze dot.
         def drawRect_(self, rect) -> None:
             NSColor.clearColor().set()
             NSBezierPath.fillRect_(rect)
@@ -139,16 +97,13 @@ if _OVERLAY_AVAILABLE:
                 dot.stroke()
 
 else:
-    _OverlayView = None  # Referenced only when _OVERLAY_AVAILABLE is True.
+    _OverlayView = None
 
 
+# Manages the transparent overlay window and content view on macOS.
 class ScreenOverlay:
-    """Lazily creates a single transparent overlay window sized to the
-    focused window's bounds, and repositions/redraws it on demand.
-    Construction alone draws nothing -- call update() each tick with the
-    current blocks/bounds/gaze point; the window is created on first use
-    and moved/resized whenever bounds change (window switch, or resize)."""
 
+    # Raises if the pyobjc Cocoa framework is not installed.
     def __init__(self):
         if not _OVERLAY_AVAILABLE:
             raise RuntimeError(
@@ -160,17 +115,10 @@ class ScreenOverlay:
         self._window: NSWindow | None = None
         self._view: "_OverlayView | None" = None
 
+    # Creates or repositions the overlay window to match the given window bounds.
     def _ensure_window(self, bounds: WindowBounds) -> None:
         NSApplication.sharedApplication()
         screen = NSScreen.mainScreen()
-        # Quartz/CGWindow bounds (what `bounds` is, same as everywhere else
-        # in this project) are top-left-origin, y-down, in the global
-        # display coordinate space. AppKit's own window-frame coordinates
-        # are bottom-left-origin, y-up, in that same global space. Flipping
-        # against the *main* screen's height is the standard conversion for
-        # this -- it can misplace things on an unusual multi-monitor setup
-        # where the main screen isn't the one being read from, but that's
-        # untested here, same as the rest of this module.
         screen_h = screen.frame().size.height if screen is not None else bounds.y + bounds.height
         appkit_y = screen_h - bounds.y - bounds.height
         frame = NSMakeRect(bounds.x, appkit_y, bounds.width, bounds.height)
@@ -184,13 +132,18 @@ class ScreenOverlay:
             self._window.setBackgroundColor_(NSColor.clearColor())
             self._window.setLevel_(_NS_SCREEN_SAVER_WINDOW_LEVEL)
             self._window.setIgnoresMouseEvents_(True)
-            self._window.setSharingType_(NSWindowSharingNone)
+            self._window.setCollectionBehavior_(
+                _NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+                | _NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+                | _NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE
+            )
             self._window.setContentView_(self._view)
             self._window.orderFrontRegardless()
         else:
             self._window.setFrame_display_(frame, False)
             self._view.setFrame_(NSMakeRect(0, 0, bounds.width, bounds.height))
 
+    # Updates the overlay's drawing state and triggers a redraw.
     def update(
         self,
         blocks: list[ContentBlock],
@@ -208,10 +161,16 @@ class ScreenOverlay:
         self._view.setNeedsDisplay_(True)
         self._window.displayIfNeeded()
 
+    # Returns the overlay window's id, or None if not created.
+    def window_id(self) -> int | None:
+        return self._window.windowNumber() if self._window is not None else None
+
+    # Hides the overlay window.
     def hide(self) -> None:
         if self._window is not None:
             self._window.orderOut_(None)
 
+    # Closes the overlay window and releases it.
     def close(self) -> None:
         if self._window is not None:
             self._window.close()

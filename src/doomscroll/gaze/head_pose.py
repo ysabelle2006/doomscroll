@@ -1,4 +1,5 @@
-"""Calculates 3D head orientation (yaw, pitch, roll) from 2D facial landmarks using OpenCV solvePnP."""
+# Estimates 3D head pose (yaw/pitch/roll) from face landmarks via solvePnP.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,20 +16,20 @@ from doomscroll.landmarks.mediapipe_backend import (
     RIGHT_EYE_RIGHT_CORNER,
 )
 
-# Standard 3D face model points in millimeters, centered at the nose tip (0, 0, 0)
+# Generic 3D face model points (nose, chin, eye corners, mouth corners), in mm.
 _MODEL_POINTS_3D = np.array(
     [
-        (0.0, 0.0, 0.0),          # Nose tip
-        (0.0, -330.0, -65.0),      # Chin
-        (-225.0, 170.0, -135.0),   # Left eye corner
-        (225.0, 170.0, -135.0),    # Right eye corner
-        (-150.0, -150.0, -125.0),  # Left mouth corner
-        (150.0, -150.0, -125.0),   # Right mouth corner
+        (0.0, 0.0, 0.0),
+        (0.0, -330.0, -65.0),
+        (-225.0, 170.0, -135.0),
+        (225.0, 170.0, -135.0),
+        (-150.0, -150.0, -125.0),
+        (150.0, -150.0, -125.0),
     ],
     dtype=np.float64,
 )
 
-# Indices of the 6 landmarks corresponding to the 3D model points
+# Landmark indices matching the 3D model points above, in the same order.
 _LANDMARK_INDICES = [
     NOSE_TIP,
     CHIN,
@@ -38,23 +39,23 @@ _LANDMARK_INDICES = [
     MOUTH_RIGHT_CORNER,
 ]
 
-# Default starting guesses: looking straight ahead, 40cm from the camera
+# Fallback initial guess for solvePnP when there's no previous frame's pose.
 _DEFAULT_RVEC = np.zeros((3, 1))
 _DEFAULT_TVEC = np.array([[0.0], [0.0], [400.0]])
 
 
+# One frame's estimated head rotation (yaw/pitch/roll) and position.
 @dataclass
 class HeadPose:
-    """Stores calculated head orientation angles and transformation vectors."""
     yaw_deg: float
     pitch_deg: float
     roll_deg: float
-    rotation_vector: np.ndarray  # Rodrigues (axis-angle) form, as returned by solvePnP
-    translation_vector: np.ndarray  # camera-frame position of the model's origin (nose tip)
+    rotation_vector: np.ndarray
+    translation_vector: np.ndarray
 
 
+# Builds an approximate camera intrinsics matrix from the image size.
 def _camera_matrix(image_width: int, image_height: int) -> np.ndarray:
-    """Estimates camera internal focal length and optical center based on frame dimensions."""
     focal_length = image_width
     center = (image_width / 2, image_height / 2)
     return np.array(
@@ -67,8 +68,8 @@ def _camera_matrix(image_width: int, image_height: int) -> np.ndarray:
     )
 
 
+# Unwraps pitch across the +-90 degree seam into a continuous range.
 def _unwrap_pitch(pitch: float) -> float:
-    """Corrects pitch angle wrapping near +/-180 degrees back to near 0 for a frontal face."""
     if pitch < -90:
         return -(180 + pitch)
     if pitch > 90:
@@ -76,25 +77,24 @@ def _unwrap_pitch(pitch: float) -> float:
     return pitch
 
 
+# Estimates head pose frame-by-frame, using the previous pose as solvePnP's initial guess.
 class HeadPoseEstimator:
-    """Estimates head pose frame-by-frame, using previous estimates as a starting guess to stay stable."""
 
     def __init__(self):
         self._prev_rvec: np.ndarray | None = None
         self._prev_tvec: np.ndarray | None = None
 
+    # Clears the previous-pose guess, e.g. after the face is lost.
     def reset(self) -> None:
-        """Clears stored pose history when tracking drops."""
         self._prev_rvec = None
         self._prev_tvec = None
 
+    # Solves for this frame's head pose; returns None if the solve fails or looks invalid.
     def estimate(self, landmarks_px: np.ndarray, image_width: int, image_height: int) -> HeadPose | None:
-        # Extract only the 6 landmarks used by our 3D face model
         image_points = landmarks_px[_LANDMARK_INDICES].astype(np.float64)
         camera_matrix = _camera_matrix(image_width, image_height)
-        dist_coeffs = np.zeros((4, 1))  # Assume minimal lens distortion
+        dist_coeffs = np.zeros((4, 1))
 
-        # Seed solvePnP with previous frame's pose to prevent flipped solutions
         rvec_guess = self._prev_rvec.copy() if self._prev_rvec is not None else _DEFAULT_RVEC.copy()
         tvec_guess = self._prev_tvec.copy() if self._prev_tvec is not None else _DEFAULT_TVEC.copy()
 
@@ -112,19 +112,16 @@ class HeadPoseEstimator:
             self.reset()
             return None
 
-        # Convert rotation vector to 3x3 matrix and extract Euler angles
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
         pose_matrix = cv2.hconcat([rotation_matrix, translation_vector])
         _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(pose_matrix)
         pitch, yaw, roll = (float(a) for a in euler_angles.flatten())
         pitch = _unwrap_pitch(pitch)
 
-        # Sanity check: reject poses with extreme head roll (>90 deg) or behind the camera (Z <= 0)
         if abs(roll) > 90 or translation_vector[2, 0] <= 0:
             self.reset()
             return None
 
-        # Save current pose as the starting guess for the next frame
         self._prev_rvec = rotation_vector
         self._prev_tvec = translation_vector
 

@@ -1,4 +1,4 @@
-"""MediaPipe Face Landmarker setup to detect 478 face and iris points across video frames."""
+# LandmarkBackend implementation using MediaPipe's face landmarker model.
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,13 +15,14 @@ from mediapipe.tasks.python.vision import (
 
 from doomscroll.landmarks.base import FaceLandmarkResult, LandmarkBackend
 
-# Default location of the pre-trained MediaPipe task model
+# Default path to the bundled MediaPipe face landmarker model file.
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[3] / "models" / "face_landmarker.task"
 
 
+# Detects face landmarks per frame using MediaPipe's video-mode face landmarker.
 class MediaPipeLandmarkBackend(LandmarkBackend):
-    """Runs MediaPipe Face Landmarker in video mode to extract facial landmark coordinates."""
 
+    # Loads the MediaPipe face landmarker model.
     def __init__(self, model_path: Path | str = DEFAULT_MODEL_PATH, num_faces: int = 1):
         model_path = Path(model_path)
         if not model_path.exists():
@@ -30,7 +31,6 @@ class MediaPipeLandmarkBackend(LandmarkBackend):
                 "Download face_landmarker.task from the MediaPipe model hub."
             )
         
-        # Configure MediaPipe to run on CPU in VIDEO mode for temporal smoothing
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(model_path), delegate=BaseOptions.Delegate.CPU),
             running_mode=RunningMode.VIDEO,
@@ -41,14 +41,12 @@ class MediaPipeLandmarkBackend(LandmarkBackend):
         self._detector = FaceLandmarker.create_from_options(options)
         self._last_timestamp_ms = -1
 
+    # Runs MediaPipe detection on a frame, ensuring strictly increasing timestamps.
     def detect(self, frame_bgr: np.ndarray, timestamp_ms: int) -> FaceLandmarkResult | None:
-        """Processes a video frame and returns the detected 3D landmark points."""
-        # MediaPipe VIDEO mode requires timestamps to strictly increase
         if timestamp_ms <= self._last_timestamp_ms:
             timestamp_ms = self._last_timestamp_ms + 1
         self._last_timestamp_ms = timestamp_ms
 
-        # Convert OpenCV BGR image to RGB as required by MediaPipe
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         result = self._detector.detect_for_video(mp_image, timestamp_ms)
@@ -56,18 +54,17 @@ class MediaPipeLandmarkBackend(LandmarkBackend):
         if not result.face_landmarks:
             return None
 
-        # Extract normalized (x, y, z) coordinates for the primary face
         landmarks = result.face_landmarks[0]
         points = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float64)
         h, w = frame_bgr.shape[:2]
         return FaceLandmarkResult(points=points, image_width=w, image_height=h)
 
+    # Releases the MediaPipe detector.
     def close(self) -> None:
-        """Closes the underlying detector and frees resources."""
         self._detector.close()
 
 
-# Key landmark indices in the MediaPipe 478-point mesh
+# MediaPipe face mesh landmark indices used elsewhere for key facial points.
 NOSE_TIP = 1
 CHIN = 152
 LEFT_EYE_LEFT_CORNER = 33
@@ -75,6 +72,5 @@ RIGHT_EYE_RIGHT_CORNER = 263
 MOUTH_LEFT_CORNER = 61
 MOUTH_RIGHT_CORNER = 291
 
-# Indices for iris tracking (5 points per eye)
 LEFT_IRIS = list(range(468, 473))
 RIGHT_IRIS = list(range(473, 478))

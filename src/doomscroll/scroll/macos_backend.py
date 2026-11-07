@@ -1,9 +1,4 @@
-"""macOS synthetic scroll injection via Quartz CGEventCreateScrollWheelEvent.
-
-Not exercised on the Windows dev machine -- validate on macOS before relying
-on it, per the project plan's known-risks list (event targeting and
-per-app handling of synthetic scroll events varies).
-"""
+# macOS implementation of ScrollInjector using Quartz CGEvents.
 from __future__ import annotations
 
 from doomscroll.scroll.base import ScrollInjector, ScrollUnit
@@ -25,7 +20,9 @@ except ImportError:
     _QUARTZ_AVAILABLE = False
 
 
+# Posts synthetic scroll wheel events via Quartz.
 class MacOSScrollInjector(ScrollInjector):
+    # Raises if the pyobjc Quartz framework is not installed.
     def __init__(self):
         if not _QUARTZ_AVAILABLE:
             raise RuntimeError(
@@ -34,6 +31,7 @@ class MacOSScrollInjector(ScrollInjector):
                 "already have installed it; try re-running that."
             )
 
+    # Warps the cursor to target_point (if given), scrolls, then restores it.
     def scroll(
         self,
         dx: int,
@@ -41,9 +39,6 @@ class MacOSScrollInjector(ScrollInjector):
         unit: ScrollUnit = ScrollUnit.LINE,
         target_point: tuple[int, int] | None = None,
     ) -> None:
-        # Scroll wheel events are delivered based on cursor position, not
-        # window focus, so (as on Windows) briefly warp the cursor to the
-        # target and back rather than leave it wherever it was.
         original_point = None
         if target_point is not None:
             original_point = CGEventGetLocation(CGEventCreate(None))
@@ -51,9 +46,6 @@ class MacOSScrollInjector(ScrollInjector):
 
         try:
             cg_unit = kCGScrollEventUnitLine if unit == ScrollUnit.LINE else kCGScrollEventUnitPixel
-            # CGEventCreateScrollWheelEvent axis convention: positive vertical
-            # delta scrolls up (content moves down); negate so positive dy
-            # means "scroll down", matching this project's sign convention.
             event = CGEventCreateScrollWheelEvent(None, cg_unit, 2, -dy, dx)
             CGEventPost(kCGHIDEventTap, event)
         finally:

@@ -1,26 +1,6 @@
-"""Re-estimate the CNN's cursor-lag from the built feature datasets.
+# Estimates the best cursor-lag value by sweeping candidates and
+# scoring each with ridge regression.
 
-    python scripts/train_model.py
-
-Writes the result to models/gaze_model.joblib's metadata, where
-scripts/train_cnn.py's default_lag() picks it up automatically on its next
-retrain -- app.py's "Record, train & calibrate" flow runs build_dataset.py
-then this script, right before retraining the CNN, so every new recording
-feeds back into the CNN's lag estimate without anyone having to run this
-by hand.
-
-This used to also train and compare a standalone predictor for the math
-model (ridge vs. mlp vs. histogram-gradient-boosting) for research into
-its own recipe. That's not needed in production: scripts/calibrate.py's
-GazeCalibrator is fit fresh from each session's own calibration sweep and
-never loads anything from this file, and nothing else loads a saved
-predictor out of it either -- the only thing anything in this project
-reads back out of models/gaze_model.joblib is train_cnn.py's
-default_lag(), which just wants metadata["lag_ms"]. So that's the only
-thing computed and saved here now. The old multi-model comparison/
-evaluation tooling is still in git history if that research is ever
-revisited.
-"""
 from __future__ import annotations
 
 import sys
@@ -35,11 +15,13 @@ from doomscroll.ml.model import DEFAULT_MODEL_PATH
 from doomscroll.ml.training import evaluate_candidates, pool
 from doomscroll.recording.session import FEATURES_DIR
 
+# Labeling window/travel threshold and lag values to sweep.
 WINDOW_MS = 600.0
 MIN_TRAVEL_PX = 40.0
 LAG_SWEEP_MS = (-100, 0, 100, 200, 300)
 
 
+# Loads sessions, picks the best lag, and saves it to the model file.
 def main() -> None:
     sessions = load_all(FEATURES_DIR)
     if not sessions:

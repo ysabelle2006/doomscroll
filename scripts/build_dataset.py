@@ -1,16 +1,4 @@
-"""Run MediaPipe over recorded sessions -> one features .npz per session.
-
-    python scripts/build_dataset.py                 # all sessions in data/recordings
-    python scripts/build_dataset.py --session data/recordings/nicole_20250101_120000
-
-The math-model counterpart of build_crops.py (output: datasets/features/,
-at the project root -- see doomscroll.recording.session's own docstring
-for why that's separate from this file's data/ -- NOT data/datasets/, an
-old location that's no longer read by anything). Slow (every frame goes
-through MediaPipe); skips sessions already built unless --force. Re-run
-with --force after changing doomscroll/ml/features.py. Labels (lag, idle
-filter) are applied later, in train_model.py.
-"""
+# Builds per-session handcrafted-feature datasets (.npz) from recorded sessions via MediaPipe.
 from __future__ import annotations
 
 import argparse
@@ -26,8 +14,24 @@ from doomscroll.recording.session import FEATURES_DIR, SessionPaths, find_sessio
 ROOT = Path(__file__).resolve().parents[1] / "data"
 
 
+_DESCRIPTION = """Run MediaPipe over recorded sessions -> one features .npz per session.
+
+    python scripts/build_dataset.py                 # all sessions in data/recordings
+    python scripts/build_dataset.py --session data/recordings/nicole_20250101_120000
+
+The math-model counterpart of build_crops.py (output: datasets/features/,
+at the project root, kept separate from this file's data/ -- NOT
+data/datasets/, an old location that's no longer read by anything).
+Slow (every frame goes through MediaPipe); skips sessions already built
+unless --force. Re-run with --force after changing
+doomscroll/ml/features.py. Labels (lag, idle filter) are applied later,
+in train_model.py.
+"""
+
+
+# Builds a features .npz for each session, skipping already-built ones unless --force.
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=_DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recordings", type=Path, default=ROOT / "recordings")
     ap.add_argument("--out", type=Path, default=FEATURES_DIR)
     ap.add_argument("--session", type=Path, action="append", help="build only this session folder (repeatable)")
