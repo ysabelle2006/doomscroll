@@ -1,8 +1,5 @@
-"""
-Phase 1 validation: webcam capture + face-mesh landmarks + head pose,
-rendered live. Confirms landmark/pose quality before building calibration or
-content-awareness on top.
-"""
+# Live webcam debug view: shows face landmarks, iris points, and head pose.
+
 from __future__ import annotations
 
 import sys
@@ -11,7 +8,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Add the 'src' directory to Python path so we can import internal modules
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from doomscroll.capture.webcam import WebcamSource
@@ -23,18 +19,19 @@ from doomscroll.landmarks.mediapipe_backend import (
 )
 
 
+# Draws the head-pose rotation axes (red/green/blue) at the given origin point.
 def draw_axes(frame: np.ndarray, origin: tuple[int, int], head_pose) -> None:
     rotation_matrix, _ = cv2.Rodrigues(head_pose.rotation_vector)
     axis_len = 80
     axes_3d = np.float64([[axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]])
-    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Red, Green, Blue in OpenCV BGR
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     for axis, color in zip(axes_3d, colors):
-        # Rotate the axis vector according to head tilt and translate to image space
         rotated = rotation_matrix @ axis
         end = (int(origin[0] + rotated[0]), int(origin[1] - rotated[1]))
         cv2.line(frame, origin, end, color, 2)
 
 
+# Runs the webcam loop, drawing landmarks/iris/pose on each frame until 'q' is pressed.
 def main() -> None:
     backend = MediaPipeLandmarkBackend()
     pose_estimator = HeadPoseEstimator()
@@ -52,19 +49,15 @@ def main() -> None:
             if result is not None:
                 points_px = result.points_px()
 
-                # Draw green dots for all face mesh landmarks
                 for x, y in points_px.astype(int):
                     cv2.circle(frame, (x, y), 1, (0, 200, 0), -1)
 
-                # Draw yellow dots specifically for the irises
                 for idx in LEFT_IRIS + RIGHT_IRIS:
                     x, y = points_px[idx].astype(int)
                     cv2.circle(frame, (x, y), 2, (0, 255, 255), -1)
 
-                # Estimate head rotation angles
                 head_pose = pose_estimator.estimate(points_px, result.image_width, result.image_height)
                 if head_pose is not None:
-                    # Landmark 1 is the nose tip; draw the orientation axes from it
                     nose_x, nose_y = points_px[1].astype(int)
                     draw_axes(frame, (nose_x, nose_y), head_pose)
                     text = f"yaw={head_pose.yaw_deg:.1f} pitch={head_pose.pitch_deg:.1f} roll={head_pose.roll_deg:.1f}"
@@ -72,7 +65,6 @@ def main() -> None:
                 else:
                     cv2.putText(frame, "Pose solve failed/rejected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
             else:
-                # Clear previous frame's pose memory when face is lost
                 pose_estimator.reset()
                 cv2.putText(frame, "No face detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 

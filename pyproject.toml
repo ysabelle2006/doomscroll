@@ -8,21 +8,38 @@ dependencies = [
     "mediapipe==0.10.21",
     "numpy",
     "scikit-learn",
+    "joblib",
     "mss",
+    "pynput",  # global cursor position for scripts/record_session.py's data collection
     "pydantic>=2",
     "platformdirs",
     "loguru",
+    # macOS-only backends (scroll/windowing injection, Vision-based OCR content
+    # scanner) -- gated by the sys_platform marker so a plain `uv sync` /
+    # `pip install .` on macOS just works, with no separate --extra needed;
+    # the marker makes these a no-op on Windows/Linux, same as never listing
+    # them there at all.
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
 windows = ["pywin32"]
-macos = ["pyobjc-framework-Quartz", "pyobjc-framework-Cocoa"]
+cnn = ["torch>=2.2"]  # only for scripts/train_cnn.py and running the CNN gaze model
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
 
 [build-system]
 requires = ["setuptools>=68"]
