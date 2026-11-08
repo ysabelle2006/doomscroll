@@ -80,10 +80,7 @@ CNN_CORRECTION_PATH = Path(user_data_dir("doomscroll")) / "calibration" / "affin
 SESSIONS_DIR = MATH_PROFILE_PATH.parent / "sessions"
 
 CLEAR_CALIBRATIONS_HELP = (
-    "Deletes the saved math calibration profile, the saved CNN per-user correction, and all "
-    "stored calibration sessions (used by --pool on the Quick Start box). Both pipelines will "
-    "need a full recalibration before they'll run again, and --pool will have nothing to pool "
-    "against until new sessions are captured."
+    "This will remove all saved calibration settings. You will need to recalibrate again before eye tracking can be used."
 )
 
 DEV_VIEW_HELP = (
@@ -662,7 +659,7 @@ class App:
 
         reset_row = ttk.Frame(parent)
         reset_row.pack(anchor="w", padx=10, pady=(20, 10))
-        btn_clear = ttk.Button(reset_row, text="Clear all calibrations", command=self._on_clear_calibrations)
+        btn_clear = ttk.Button(reset_row, text="Reset calibration data", command=self._on_clear_calibrations)
         btn_clear.pack(side="left")
         self.buttons.append(btn_clear)
         self._make_help_badge(reset_row, self._show_clear_calibrations_help).pack(side="left", padx=(6, 0))
@@ -725,7 +722,7 @@ class App:
             self._set_buttons_enabled(True)
             if not success and not self.runner.silent_failure:
                 _bring_window_to_front(self.root)
-                messagebox.showerror("doomscroll launcher", "A step failed -- see the log for details.")
+                messagebox.showerror("doomscroll launcher", "Error occurred: Please refer to Settings > Log for more details")
             self.runner.silent_failure = False
 
         self.runner.start(worker, on_done)
@@ -925,9 +922,7 @@ class App:
             return
         proceed = messagebox.askyesno(
             "doomscroll launcher",
-            "Calibrating the CNN without recording & training only fits a small per-user "
-            "correction on top of the existing model -- accuracy will likely not be as good as "
-            "doing a full record & train. Continue anyway?",
+            "Skip personalised setup? This option only applies a quick adjustment to the existing eye-tracking model. Accuracy may be low if personalised setup has not been completed.",
             icon="warning",
         )
         if not proceed:
