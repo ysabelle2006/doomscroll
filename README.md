@@ -2,6 +2,8 @@
 
 Gaze/head-tracking content-aware auto-scroll. Tracks where you're looking via webcam, maps that to screen coordinates with a calibrated model, and uses it to drive content-aware scroll behavior.
 
+Demo Video: https://youtu.be/ZLQ8kBFiwiI
+
 ## Setup
 
 Requires Python 3.11 or 3.12 (`requires-python = ">=3.11,<3.13"` in `pyproject.toml`).
